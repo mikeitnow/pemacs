@@ -37,13 +37,27 @@ final class Terminal {
 
     public function raw(): void {
         // Disabilita XON/XOFF (Ctrl+S / Ctrl+Q) e imposta modalità raw
-        shell_exec('stty -ixon -icanon -echo -isig min 1 time 0');
+        // Abilita solo SIGTSTP (Ctrl+Z), ma disabilita SIGINT/SIGQUIT così Ctrl+C resta gestito dall'editor
+        // intr ^- e quit ^- disattivano i tasti di interrupt/quit
+        shell_exec('stty -ixon -icanon -echo isig intr ^- quit ^- min 1 time 0');
         // Entra nello schermo alternativo in modo compatibile
         $smcup = rtrim(shell_exec('tput smcup 2>/dev/null') ?? '');
         if ($smcup !== '') { fwrite(STDOUT, $smcup); }
         else { fwrite(STDOUT, Ansi::ESC.'[?1049h'); }
         // Pulisci e mostra il cursore
         fwrite(STDOUT, Ansi::clear().Ansi::reset().Ansi::showCursor());
+    }
+
+    public function rawSafe(): void {
+        if (function_exists('pcntl_signal')) {
+            @pcntl_signal(SIGTTOU, SIG_IGN);
+            @pcntl_signal(SIGTTIN, SIG_IGN);
+        }
+        $this->raw();
+        if (function_exists('pcntl_signal')) {
+            @pcntl_signal(SIGTTOU, SIG_DFL);
+            @pcntl_signal(SIGTTIN, SIG_DFL);
+        }
     }
 
     public function restore(): void {
@@ -515,9 +529,15 @@ final class Input {
     private ?array $pending = null; // for Ctrl-x prefix handling
 
     public function readKey(): array {
+        // Redraw request after SIGCONT: fa uscire subito per permettere il redraw
+        if (($GLOBALS['__pemacs_sigcont'] ?? false) === true) { return [Keys::SPECIAL, 'sigcont']; }
         // Wait for a byte
         $c = fread(STDIN, 1);
-        while ($c === '' || $c === false) { usleep(10000); $c = fread(STDIN, 1); }
+        while ($c === '' || $c === false) {
+            if (($GLOBALS['__pemacs_sigcont'] ?? false) === true) { return [Keys::SPECIAL, 'sigcont']; }
+            usleep(10000);
+            $c = fread(STDIN, 1);
+        }
 
         // Enter prima, per evitare che CR venga interpretato come Ctrl+M
         if ($c === "\r" || $c === "\n") return [Keys::SPECIAL, 'enter'];
@@ -580,6 +600,7 @@ final class Input {
 
     // Non-blocking: restituisce null se non c'è input immediatamente disponibile
     public function readKeyNow(): ?array {
+        if (($GLOBALS['__pemacs_sigcont'] ?? false) === true) { return [Keys::SPECIAL, 'sigcont']; }
         $c = fread(STDIN, 1);
         if ($c === '' || $c === false) { return null; }
 
@@ -694,6 +715,25 @@ final class Editor {
         fwrite(STDOUT, Ansi::clear());
         $this->renderer->draw();
         while (true) {
+            if (($GLOBALS['__pemacs_sigcont'] ?? false) === true) {
+                // Reinizializza modalità raw e schermo alternativo fuori dal signal handler
+                $this->term->rawSafe();
+                fwrite(STDOUT, Ansi::clear());
+                usleep(20000);
+                // Reimposta lettura non bloccante su STDIN (alcuni terminali la perdono dopo fg)
+                @stream_set_blocking(STDIN, false);
+                // Svuota eventuale input accumulato (sequenze digitate mentre era sospeso)
+                while (true) {
+                    $chunk = @fread(STDIN, 4096);
+                    if ($chunk === '' || $chunk === false) { break; }
+                    // continua a svuotare fino a buffer vuoto
+                }
+                $this->term->querySize();
+                $this->renderer->invalidate();
+                $this->renderer->setWindows($this->wins, $this->active);
+                $this->renderer->draw();
+                $GLOBALS['__pemacs_sigcont'] = false;
+            }
             $key = $this->input->readKey();
             $handled = $this->dispatchKey($key);
             if ($handled === 'quit') { break; }
@@ -736,6 +776,7 @@ final class Editor {
 
         if ($type === Keys::CTRL && $val === 'x') { $this->ctrlXPrefix = true; $this->setStatus('C-x'); return null; }
 		if ($type === Keys::CTRL && $val === 's') { $this->incrementalSearch(''); return null; }
+        if ($type === Keys::SPECIAL && $val === 'sigcont') { return null; }
 
         if ($type === Keys::CTRL && $val === ' ') { $w->hasMark = !$w->hasMark; if ($w->hasMark) { $w->markRow=$w->cursorRow; $w->markCol=$w->cursorCol; $this->setStatus('Mark set'); } else { $this->setStatus('Mark cleared'); } return null; }
         if ($type === Keys::CTRL && $val === 'w') { $this->killRegion(); return null; }
@@ -1639,6 +1680,28 @@ if (function_exists('pcntl_signal')) {
     @pcntl_signal(SIGTERM, $handler);
     @pcntl_signal(SIGHUP, $handler);
     @pcntl_signal(SIGQUIT, $handler);
+    // Ctrl+Z support: su SIGTSTP ripristina terminale e poi sospendi davvero; su SIGCONT rientra in raw e ridisegna
+    $tstpHandler = function(int $sig) use ($term) {
+        $term->restore();
+        // Passa all'azione di default (sospensione): reimposta handler default e re-invia segnale
+        if (function_exists('pcntl_signal')) { @pcntl_signal(SIGTSTP, SIG_DFL); }
+        if (function_exists('posix_kill')) { @posix_kill(getmypid(), SIGTSTP); }
+        else { @shell_exec('kill -TSTP '.getmypid()); }
+    };
+    $GLOBALS['__pemacs_tstp_handler'] = $tstpHandler;
+    @pcntl_signal(SIGTSTP, $tstpHandler);
+    $contHandler = function(int $sig) use ($term) {
+        // Solo segnala; la re-inizializzazione raw avverrà nel main loop
+        // Reinstalla handler SIGTSTP
+        if (function_exists('pcntl_signal') && isset($GLOBALS['__pemacs_tstp_handler'])) {
+            @pcntl_signal(SIGTSTP, $GLOBALS['__pemacs_tstp_handler']);
+        }
+        // Segnala al main loop di invalidare e ridisegnare completamente
+        $GLOBALS['__pemacs_sigcont'] = true;
+        // Assicurati che la lettura non resti bloccata
+        @stream_set_blocking(STDIN, false);
+    };
+    @pcntl_signal(SIGCONT, $contHandler);
     // Gestione asincrona: niente bisogno di pcntl_signal_dispatch nel loop
     if (function_exists('pcntl_async_signals')) { @pcntl_async_signals(true); }
 }
