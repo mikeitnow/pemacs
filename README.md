@@ -99,7 +99,6 @@ If you pass a path that doesn’t exist, pemacs will create the file on save. It
 Notes:
 - Mark + region are shown with reverse video.
 - Tabs are visualized as single spaces for rendering, but indentation uses real tabs.
-- Clipboard is internal to pemacs (no system clipboard integration).
 
 ### Find File mini-picker 📁
 - Inline list opens above the status bar.
