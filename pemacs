@@ -350,6 +350,11 @@ final class Renderer {
     private array $windows;
     private int $activeIndex = 0;
     private string $statusMsg = '';
+    /** @var array<int,string> righe renderizzate nell'ultimo frame (contenuto con SGR, senza movimenti) */
+    private array $lastLineContent = [];
+    /** @var array<int,?array{start:int,len:int,seg:string}> overlay selezione per riga schermo */
+    private array $lastSelSeg = [];
+    private string $lastStatusBar = '';
 
     public function __construct(Terminal $term, Buffer $buf, array $windows) {
         $this->term = $term; $this->buf = $buf; $this->windows = $windows;
@@ -378,45 +383,70 @@ final class Renderer {
             $this->windows = [$upper, $lower];
         }
 
-        $out = Ansi::move(1,1);
+        $out = Ansi::hideCursor();
         foreach ($this->windows as $wi => $w) {
-            // Draw text area
+            // Draw text area (differenziale per riga)
             for ($r = 0; $r < $w->height; $r++) {
+                $screenRow = $w->topRow + $r;
                 $bufRow = $w->scrollTop + $r;
                 $line = $this->buf->lines[$bufRow] ?? '';
-                // Visualizza TAB come spazio singolo; colorizza tutta la riga e poi slice ANSI-safe
                 $visual = str_replace("\t", ' ', $line);
                 $colored = Highlighter::colorize($visual);
                 $rendered = self::sliceAnsi($colored, $w->hscroll, $w->width);
-                $out .= Ansi::move($w->topRow + $r, 1).Ansi::clearLine().Ansi::color(Palette::base()).$rendered.Ansi::reset();
-                // Evidenzia selezione con reverse video, lasciando visibile il testo
+                $content = Ansi::color(Palette::base()).$rendered.Ansi::reset();
+
+                $updatedBase = false;
+                $prev = $this->lastLineContent[$screenRow] ?? null;
+                if ($prev !== $content) {
+                    $out .= Ansi::move($screenRow, 1).Ansi::clearLine().$content;
+                    $this->lastLineContent[$screenRow] = $content;
+                    $updatedBase = true;
+                }
+
+                // Overlay selezione: applica solo se cambiata oppure se la base è stata aggiornata
+                $selInfo = null;
                 $sel = $w->selectionBounds();
                 if ($sel && $bufRow >= $sel[0][0] && $bufRow <= $sel[1][0]) {
-                    // compute selection col range
                     $startCol = ($bufRow === $sel[0][0]) ? $sel[0][1] : 0;
                     $endCol = ($bufRow === $sel[1][0]) ? $sel[1][1] : strlen($visual);
                     if ($endCol > $startCol) {
                         $startCol = max(0, $startCol - $w->hscroll);
                         $length = min($endCol - $w->hscroll - $startCol, max(0, $w->width - $startCol));
                         if ($length > 0) {
-                            // Re-stampa testo grezzo selezionato con reverse video (niente SGR interni)
                             $seg = substr($visual, $w->hscroll + $startCol, $length);
-                            $out .= Ansi::move($w->topRow + $r, 1 + $startCol)
-                                  .Ansi::color(Palette::selection())
-                                  .$seg
-                                  .Ansi::reset();
+                            $selInfo = ['start'=>$startCol, 'len'=>$length, 'seg'=>$seg];
                         }
                     }
                 }
+                $prevSel = $this->lastSelSeg[$screenRow] ?? null;
+                if ($updatedBase) {
+                    if ($selInfo !== null) {
+                        $out .= Ansi::move($screenRow, 1 + $selInfo['start']).Ansi::color(Palette::selection()).$selInfo['seg'].Ansi::reset();
+                    }
+                    $this->lastSelSeg[$screenRow] = $selInfo;
+                } else if (($selInfo === null && $prevSel !== null) || ($selInfo !== null && $prevSel !== null && ($selInfo['start'] !== $prevSel['start'] || $selInfo['len'] !== $prevSel['len'] || $selInfo['seg'] !== $prevSel['seg'])) || ($selInfo !== null && $prevSel === null)) {
+                    // Se l'overlay è cambiato ma la base non è stata aggiornata, ridisegna la riga base e poi l'overlay
+                    $out .= Ansi::move($screenRow, 1).Ansi::clearLine().$content;
+                    if ($selInfo !== null) {
+                        $out .= Ansi::move($screenRow, 1 + $selInfo['start']).Ansi::color(Palette::selection()).$selInfo['seg'].Ansi::reset();
+                    }
+                    $this->lastSelSeg[$screenRow] = $selInfo;
+                    $this->lastLineContent[$screenRow] = $content;
+                }
             }
-            // Se c'è una finestra successiva, disegna separatore orizzontale
+            // Se c'è una finestra successiva, disegna separatore orizzontale (differenziale)
             if (count($this->windows) > 1 && $wi === 0) {
                 $sepRow = $w->topRow + $w->height;
-                $out .= Ansi::move($sepRow, 1).Ansi::color(Palette::activeStatus()).str_repeat(' ', $cols).Ansi::reset();
+                $sepContent = Ansi::color(Palette::activeStatus()).str_repeat(' ', $cols).Ansi::reset();
+                if (($this->lastLineContent[$sepRow] ?? null) !== $sepContent) {
+                    $out .= Ansi::move($sepRow, 1).Ansi::clearLine().$sepContent;
+                    $this->lastLineContent[$sepRow] = $sepContent;
+                    $this->lastSelSeg[$sepRow] = null;
+                }
             }
         }
 
-        // Status bar
+        // Status bar (differenziale)
         $status = ($this->buf->dirty ? '*' : '-') . ' ' . ($this->buf->filePath !== '' ? $this->buf->filePath : '[No Name]');
         $act = $this->windows[$this->activeIndex];
         $pos = 'Ln '.($act->cursorRow+1).', Col '.($act->cursorCol+1);
@@ -424,7 +454,10 @@ final class Renderer {
         $left = $status.'  '.($this->statusMsg !== '' ? $this->statusMsg : '');
         $space = max(0, $this->term->cols - strlen($left) - strlen($right));
         $bar = Ansi::color(Palette::activeStatus()).str_pad($left, $this->term->cols - strlen($right) - $space, ' ').str_repeat(' ', $space).$right.Ansi::reset();
-        $out .= Ansi::move($this->term->rows, 1).Ansi::clearLine().$bar;
+        if ($this->lastStatusBar !== $bar) {
+            $out .= Ansi::move($this->term->rows, 1).Ansi::clearLine().$bar;
+            $this->lastStatusBar = $bar;
+        }
 
         // Place cursor
         $cur = $this->windows[$this->activeIndex];
@@ -432,7 +465,7 @@ final class Renderer {
         $cur->ensureCursorVisible($this->buf);
         $cursorRowOnScreen = $cur->topRow + ($cur->cursorRow - $cur->scrollTop);
         $cursorColOnScreen = 1 + max(0, $cur->cursorCol - $cur->hscroll);
-        $out .= Ansi::move($cursorRowOnScreen, $cursorColOnScreen);
+        $out .= Ansi::move($cursorRowOnScreen, $cursorColOnScreen).Ansi::showCursor();
 
         fwrite(STDOUT, $out);
     }
@@ -533,6 +566,51 @@ final class Input {
         }
         return [Keys::ASCII, ''];
     }
+
+    // Non-blocking: restituisce null se non c'è input immediatamente disponibile
+    public function readKeyNow(): ?array {
+        $c = fread(STDIN, 1);
+        if ($c === '' || $c === false) { return null; }
+
+        if ($c === "\r" || $c === "\n") return [Keys::SPECIAL, 'enter'];
+        if ($c === "\t") return [Keys::SPECIAL, 'tab'];
+
+        $ord = ord($c);
+        if ($ord === 0) { return [Keys::CTRL, ' ']; }
+        if ($ord >= 1 && $ord <= 26) { return [Keys::CTRL, chr($ord + 96)]; }
+        if ($ord === 127) return [Keys::SPECIAL, 'backspace'];
+        if ($c === "\x1b") {
+            $seq = $c;
+            usleep(1000);
+            $seq .= (fread(STDIN, 16) ?: '');
+            if (preg_match('/\x1b\[([0-9]+)(?:;([0-9]+))?~/', $seq, $m)) {
+                $n = intval($m[1]); $mod = isset($m[2]) ? intval($m[2]) : 0;
+                $spec = ['1'=>'home','3'=>'del','4'=>'end','5'=>'pgup','6'=>'pgdn','7'=>'home','8'=>'end'][$n] ?? '';
+                if ($spec !== '') {
+                    if ($mod === 5 && ($n===5 || $n===6)) { return [Keys::SPECIAL, $n===5 ? 'ctrl_pgup' : 'ctrl_pgdn']; }
+                    return [Keys::SPECIAL, $spec];
+                }
+            }
+            if (preg_match('/\x1b\[(H|F)/', $seq, $m)) { return [Keys::SPECIAL, $m[1]==='H' ? 'home' : 'end']; }
+            if (preg_match('/\x1b\[(?:1;\d+)(H|F)/', $seq, $m)) { return [Keys::SPECIAL, $m[1]==='H' ? 'home' : 'end']; }
+            if (preg_match('/\x1bO(H|F)/', $seq, $m)) { return [Keys::SPECIAL, $m[1]==='H' ? 'home' : 'end']; }
+            if (preg_match('/\x1b\[(?:1;([0-9]+))?([ABCD])/', $seq, $m)) {
+                $mod = isset($m[1]) ? intval($m[1]) : 0; $code = $m[2];
+                if ($mod === 5 && ($code === 'A' || $code === 'B')) { return [Keys::SPECIAL, $code === 'A' ? 'ctrl_up' : 'ctrl_down']; }
+                $map = ['A'=>'up','B'=>'down','C'=>'right','D'=>'left'];
+                return [Keys::ARROW, $map[$code]];
+            }
+            $rest = substr($seq, 1);
+            if ($rest !== '') {
+                $k = $rest[0];
+                if ($k === "\x7f" || $k === "\x08") { return [Keys::ALT, 'backspace']; }
+                return [Keys::ALT, $k];
+            }
+            return [Keys::ASCII, "\x1b"];
+        }
+        if ($ord >= 32 && $ord <= 126) { return [Keys::ASCII, $c]; }
+        return null;
+    }
 }
 
 // ---- Editor Core ----
@@ -608,6 +686,20 @@ final class Editor {
             $key = $this->input->readKey();
             $handled = $this->dispatchKey($key);
             if ($handled === 'quit') { break; }
+
+            // Coalescing: processa input immediatamente disponibile per ridurre redraw multipli
+            $start = microtime(true);
+            $steps = 0;
+            while (true) {
+                $next = $this->input->readKeyNow();
+                if ($next === null) { break; }
+                $handled = $this->dispatchKey($next);
+                if ($handled === 'quit') { break 2; }
+                $steps++;
+                if ($steps >= 64) { break; }
+                if ((microtime(true) - $start) > 0.008) { break; }
+            }
+
             $this->renderer->setWindows($this->wins, $this->active);
             $this->renderer->draw();
         }
@@ -1419,5 +1511,6 @@ if ($quitImmediately) {
     $term->restore();
     fwrite(STDOUT, Ansi::clear()); fflush(STDOUT);
 }
+
 
 
