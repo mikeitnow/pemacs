@@ -771,8 +771,33 @@ final class Editor {
                 if ($val === 'ctrl_pgdn') { $this->jumpBlankBlock(1); return null; }
                 if ($val === 'ctrl_up') { $this->jumpBlankBlock(-1); return null; }
                 if ($val === 'ctrl_down') { $this->jumpBlankBlock(1); return null; }
-                if ($val === 'pgup') { $w->cursorRow = max(0, $w->cursorRow - max(1,$w->height-1)); return null; }
-                if ($val === 'pgdn') { $w->cursorRow = min($this->buf->lineCount()-1, $w->cursorRow + max(1,$w->height-1)); return null; }
+                if ($val === 'pgup') {
+                    $delta = max(1, $w->height);
+                    $oldTop = $w->scrollTop;
+                    $maxStart = max(0, $w->buffer->lineCount() - $w->height);
+                    $newTop = max(0, $oldTop - $delta);
+                    if ($newTop > $maxStart) { $newTop = $maxStart; }
+                    $moved = $newTop - $oldTop; // negative or zero
+                    $w->scrollTop = $newTop;
+                    // Mantieni il cursore sulla stessa riga dello schermo
+                    $w->cursorRow = min(max(0, $w->cursorRow + $moved), max(0,$w->buffer->lineCount()-1));
+                    $line = $w->buffer->lines[$w->cursorRow] ?? '';
+                    $w->cursorCol = min($w->cursorCol, strlen($line));
+                    return null;
+                }
+                if ($val === 'pgdn') {
+                    $delta = max(1, $w->height);
+                    $oldTop = $w->scrollTop;
+                    $maxStart = max(0, $w->buffer->lineCount() - $w->height);
+                    $newTop = min($maxStart, $oldTop + $delta);
+                    $moved = $newTop - $oldTop; // positive or zero
+                    $w->scrollTop = $newTop;
+                    // Mantieni il cursore sulla stessa riga dello schermo
+                    $w->cursorRow = min(max(0, $w->cursorRow + $moved), max(0,$w->buffer->lineCount()-1));
+                    $line = $w->buffer->lines[$w->cursorRow] ?? '';
+                    $w->cursorCol = min($w->cursorCol, strlen($line));
+                    return null;
+                }
                 if ($val === 'tab') { $this->indentCurrentOrRegion(); return null; }
                 return null;
             case Keys::ASCII:
