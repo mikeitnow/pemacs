@@ -4,7 +4,7 @@
 // Requirements: PHP 7.4+, Linux TTY. No external PHP extensions. Uses stty + ANSI.
 
 declare(strict_types=1);
-// Evita che eventuali warning rovinino lo schermo del terminale
+// Prevent warnings from garbling the terminal screen
 @ini_set('display_errors', '0');
 
 // ---- Utility: ANSI helpers ----
@@ -36,15 +36,15 @@ final class Terminal {
     }
 
     public function raw(): void {
-        // Disabilita XON/XOFF (Ctrl+S / Ctrl+Q) e imposta modalità raw
-        // Abilita solo SIGTSTP (Ctrl+Z), ma disabilita SIGINT/SIGQUIT così Ctrl+C resta gestito dall'editor
-        // intr ^- e quit ^- disattivano i tasti di interrupt/quit
+        // Disable XON/XOFF (Ctrl+S / Ctrl+Q) and enable raw mode
+        // Enable only SIGTSTP (Ctrl+Z), but disable SIGINT/SIGQUIT so Ctrl+C remains handled by the editor
+        // intr ^- and quit ^- disable the interrupt/quit keys
         shell_exec('stty -ixon -icanon -echo isig intr ^- quit ^- min 1 time 0');
-        // Entra nello schermo alternativo in modo compatibile
+        // Enter the alternate screen in a portable way
         $smcup = rtrim(shell_exec('tput smcup 2>/dev/null') ?? '');
         if ($smcup !== '') { fwrite(STDOUT, $smcup); }
         else { fwrite(STDOUT, Ansi::ESC.'[?1049h'); }
-        // Pulisci e mostra il cursore
+        // Clear screen and show cursor
         fwrite(STDOUT, Ansi::clear().Ansi::reset().Ansi::showCursor());
     }
 
@@ -61,13 +61,13 @@ final class Terminal {
     }
 
     public function restore(): void {
-        // Reset integrale: ripristina stty e resetta schermo e scrollback
+        // Full reset: restore previous stty and reset screen + scrollback
         if ($this->sttySaved !== '') { shell_exec('stty '.$this->sttySaved); }
-        // Torna allo schermo principale in modo compatibile
+        // Return to the main screen in a portable way
         $rmcup = rtrim(shell_exec('tput rmcup 2>/dev/null') ?? '');
         if ($rmcup !== '') { fwrite(STDOUT, $rmcup); }
         else { fwrite(STDOUT, Ansi::ESC.'[?1049l'); }
-        // Pulisci visibile + scrollback, porta il cursore in home, mostra cursore e resetta colori
+        // Clear visible area + scrollback, move cursor home, show cursor, reset colors
         fwrite(STDOUT, "\033[3J\033[2J\033[H\033[0m\033[?25h");
         fflush(STDOUT);
     }
@@ -135,7 +135,7 @@ final class Window {
     public bool $hasMark = false;
     public int $markRow = 0;   // selection anchor
     public int $markCol = 0;
-    public Buffer $buffer;     // buffer associato alla finestra
+    public Buffer $buffer;     // buffer associated to this window
 
     public function __construct(int $topRow, int $height, int $width, Buffer $buffer) {
         $this->topRow = $topRow;
@@ -176,11 +176,11 @@ final class Window {
 
 // ---- Renderer and Highlighter ----
 final class Palette {
-    // Colors inspired by screenshot
+    // Colors inspired by a classic terminal look
     // Emacs-like: base fg white on black, comments gray, strings yellow, keywords bright magenta, variables cyan
     public static function base(): string { return '37;40'; }
     public static function comment(): string { return '90'; }
-    // Strings bright red per richiesta
+    // Strings bright red by request
     public static function string(): string { return '91'; }
     public static function keyword(): string { return '95'; }
     public static function variable(): string { return '33'; }
@@ -189,15 +189,15 @@ final class Palette {
     public static function htmlAttr(): string { return '36'; }
     public static function status(): string { return '30;47'; }
     public static function activeStatus(): string { return '30;46'; }
-    // Inversione video per mostrare il testo selezionato
+    // Reverse video for selected text
     public static function selection(): string { return '7'; }
-    // Function/method names: blu brillante
+    // Function/method names: bright blue
     public static function functionName(): string { return '94'; }
-    // Class names verdino
+    // Class names: greenish
     public static function className(): string { return '92'; }
-    // Proprietà oggetto dopo '->' marroncino (giallo tenue)
+    // Object property after '->': brownish (soft yellow)
     public static function propertyName(): string { return '33'; }
-    // Costanti booleane
+    // Boolean constants
     public static function constTrue(): string { return '92'; }
     public static function constFalse(): string { return '96'; }
 }
@@ -441,7 +441,7 @@ final class Renderer {
                     }
                     $this->lastSelSeg[$screenRow] = $selInfo;
                 } else if (($selInfo === null && $prevSel !== null) || ($selInfo !== null && $prevSel !== null && ($selInfo['start'] !== $prevSel['start'] || $selInfo['len'] !== $prevSel['len'] || $selInfo['seg'] !== $prevSel['seg'])) || ($selInfo !== null && $prevSel === null)) {
-                    // Se l'overlay è cambiato ma la base non è stata aggiornata, ridisegna la riga base e poi l'overlay
+                    // If the overlay changed but the base line didn't, redraw the base line and then the overlay
                     $out .= Ansi::move($screenRow, 1).Ansi::clearLine().$content;
                     if ($selInfo !== null) {
                         $out .= Ansi::move($screenRow, 1 + $selInfo['start']).Ansi::color(Palette::selection()).$selInfo['seg'].Ansi::reset();
@@ -450,7 +450,7 @@ final class Renderer {
                     $this->lastLineContent[$screenRow] = $content;
                 }
             }
-            // Se c'è una finestra successiva, disegna separatore orizzontale come barra informativa della finestra corrente
+            // If there is a second window, draw the horizontal separator as an info bar for the upper pane
             if (count($this->windows) > 1 && $wi === 0) {
                 $sepRow = $w->topRow + $w->height;
                 $buf = $w->buffer;
@@ -469,7 +469,7 @@ final class Renderer {
             }
         }
 
-        // Status bar (differenziale) per la finestra INFERIORE (indipendente dalla finestra attiva)
+        // Status bar (diff-aware) for the BOTTOM window (independent of active pane)
         $bottomIdx = max(0, count($this->windows)-1);
         $act = $this->windows[$bottomIdx];
         $buf = $act->buffer;
@@ -849,7 +849,7 @@ final class Editor {
     }
 
     private function insertChar(string $ch): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
         $w = $this->activeWin(); $row = $w->cursorRow; $col = $w->cursorCol;
         $line = $this->buf->lines[$row] ?? '';
@@ -914,9 +914,9 @@ final class Editor {
         $trimPrev = rtrim($before);
         $last = $trimPrev === '' ? '' : $trimPrev[strlen($trimPrev)-1];
         if ($last === '{') { $indent += 1; }
-        // Se la parte dopo inizia con '}', riduci
+        // If the trailing part starts with '}', reduce indent
         if (preg_match('/^\s*\}/', $after)) { $indent = max(0, $indent - 1); }
-        // Indenta usando TAB: converte spazi/tabs di indent in TAB logici
+        // Indent using TABs: convert leading spaces/tabs into logical TABs
         $newLineStr = str_repeat("\t", max(0,$indent));
         $this->buf->lines[$row] = $before;
         array_splice($this->buf->lines, $row+1, 0, [$newLineStr.$after]);
@@ -944,7 +944,7 @@ final class Editor {
         $w=$this->activeWin();
         $line = $this->buf->lines[$w->cursorRow] ?? '';
         $w->cursorCol = strlen($line);
-        // assicurati che l'ultimo carattere sia visibile
+        // ensure the last character is visible
         $w->hscroll = max(0, $w->cursorCol - intdiv(max(1,$w->width-1), 1));
     }
 
@@ -1536,8 +1536,8 @@ final class Editor {
     }
 
     private function saveFile(): void {
-        if ($this->buf->save()) { $this->setStatus('Salvato ✅'); }
-        else { $this->setStatus('Errore salvataggio ❌'); }
+        if ($this->buf->save()) { $this->setStatus('Saved ✅'); }
+        else { $this->setStatus('Save error ❌'); }
     }
 
     private function maybeQuit() {

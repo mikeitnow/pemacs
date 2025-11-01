@@ -4,10 +4,14 @@ Tiny Emacs-flavored TTY editor in pure PHP — single file, no deps. ✨
 
 This is a minimal, for-fun clone of some Emacs editing vibes written in PHP. It runs directly in your terminal, renders with ANSI escapes, and aims to be surprisingly usable despite its size. It was vibe-coded in a few hours while doing other stuff — so please don’t take it too seriously. 😄
 
+> Terminal-only: pemacs is a pure TTY editor. It opens in your terminal’s alternate screen (no X11/Wayland window will appear, unlike GUI editors such as XEmacs). Bring it to the foreground/background with the usual shell job controls.
+
+![pemacs rules](./pemacs_rules.png)
+
 ### Highlights
 - **Single-file**: just `pemacs` — easy to read, hack, and run.
 - **Pure PHP**: no extensions required (optional `pcntl` for nicer signal handling).
-- **TTY-native**: uses raw mode, alternate screen buffer, and ANSI rendering.
+- **TTY-native**: uses raw mode, alternate screen buffer, and ANSI rendering. No GUI, no X11/Wayland.
 - **Syntax color**: simple highlighter for PHP, JS, and HTML (tags/attrs), numbers, strings, comments.
 - **Status bar**: file name, modified flag, and cursor position.
 - **Incremental search**: Emacs-style `I-Search` with live updates.
@@ -109,7 +113,7 @@ Notes:
 
 ### Caveats & Tips ⚠️
 - Linux TTY focused; other environments may vary. If the screen stays in alt buffer after a crash, run `reset`.
-- Single buffer shared across splits (no multiple files at once yet).
+- Independent buffers per split: open different files in each pane.
 - Minimal undo (snapshot-based) and no redo.
 - This is a toy editor — expect rough edges. PRs welcome! 🙌
 
