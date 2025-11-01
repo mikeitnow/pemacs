@@ -121,11 +121,13 @@ final class Window {
     public bool $hasMark = false;
     public int $markRow = 0;   // selection anchor
     public int $markCol = 0;
+    public Buffer $buffer;     // buffer associato alla finestra
 
-    public function __construct(int $topRow, int $height, int $width) {
+    public function __construct(int $topRow, int $height, int $width, Buffer $buffer) {
         $this->topRow = $topRow;
         $this->height = max(1, $height);
         $this->width = $width;
+        $this->buffer = $buffer;
     }
 
     public function clampCursor(Buffer $buf): void {
@@ -345,7 +347,6 @@ final class Highlighter {
 
 final class Renderer {
     private Terminal $term;
-    private Buffer $buf;
     /** @var Window[] */
     private array $windows;
     private int $activeIndex = 0;
@@ -356,8 +357,8 @@ final class Renderer {
     private array $lastSelSeg = [];
     private string $lastStatusBar = '';
 
-    public function __construct(Terminal $term, Buffer $buf, array $windows) {
-        $this->term = $term; $this->buf = $buf; $this->windows = $windows;
+    public function __construct(Terminal $term, array $windows) {
+        $this->term = $term; $this->windows = $windows;
     }
 
     public function setWindows(array $windows, int $activeIndex): void { $this->windows = $windows; $this->activeIndex = $activeIndex; }
@@ -390,7 +391,7 @@ final class Renderer {
             for ($r = 0; $r < $w->height; $r++) {
                 $screenRow = $w->topRow + $r;
                 $bufRow = $w->scrollTop + $r;
-                $line = $this->buf->lines[$bufRow] ?? '';
+                $line = $w->buffer->lines[$bufRow] ?? '';
                 $visual = str_replace("\t", ' ', $line);
                 $colored = Highlighter::colorize($visual);
                 $rendered = self::sliceAnsi($colored, $w->hscroll, $w->width);
@@ -435,10 +436,17 @@ final class Renderer {
                     $this->lastLineContent[$screenRow] = $content;
                 }
             }
-            // Se c'è una finestra successiva, disegna separatore orizzontale (differenziale)
+            // Se c'è una finestra successiva, disegna separatore orizzontale come barra informativa della finestra corrente
             if (count($this->windows) > 1 && $wi === 0) {
                 $sepRow = $w->topRow + $w->height;
-                $sepContent = Ansi::color(Palette::activeStatus()).str_repeat(' ', $cols).Ansi::reset();
+                $buf = $w->buffer;
+                $status = ($buf->dirty ? '*' : '-') . ' ' . ($buf->filePath !== '' ? $buf->filePath : '[No Name]');
+                $pos = 'Ln '.($w->cursorRow+1).', Col '.($w->cursorCol+1);
+                $left = $status.'  '.($this->activeIndex === $wi && $this->statusMsg !== '' ? $this->statusMsg : '');
+                $right = $pos;
+                $space = max(0, $this->term->cols - strlen($left) - strlen($right));
+                $sepBar = Ansi::color(Palette::activeStatus()).str_pad($left, $this->term->cols - strlen($right) - $space, ' ').str_repeat(' ', $space).$right.Ansi::reset();
+                $sepContent = $sepBar;
                 if (($this->lastLineContent[$sepRow] ?? null) !== $sepContent) {
                     $out .= Ansi::move($sepRow, 1).Ansi::clearLine().$sepContent;
                     $this->lastLineContent[$sepRow] = $sepContent;
@@ -447,12 +455,14 @@ final class Renderer {
             }
         }
 
-        // Status bar (differenziale)
-        $status = ($this->buf->dirty ? '*' : '-') . ' ' . ($this->buf->filePath !== '' ? $this->buf->filePath : '[No Name]');
-        $act = $this->windows[$this->activeIndex];
+        // Status bar (differenziale) per la finestra INFERIORE (indipendente dalla finestra attiva)
+        $bottomIdx = max(0, count($this->windows)-1);
+        $act = $this->windows[$bottomIdx];
+        $buf = $act->buffer;
+        $status = ($buf->dirty ? '*' : '-') . ' ' . ($buf->filePath !== '' ? $buf->filePath : '[No Name]');
         $pos = 'Ln '.($act->cursorRow+1).', Col '.($act->cursorCol+1);
         $right = $pos;
-        $left = $status.'  '.($this->statusMsg !== '' ? $this->statusMsg : '');
+        $left = $status.'  '.(($this->statusMsg !== '' && $this->activeIndex === $bottomIdx) ? $this->statusMsg : '');
         $space = max(0, $this->term->cols - strlen($left) - strlen($right));
         $bar = Ansi::color(Palette::activeStatus()).str_pad($left, $this->term->cols - strlen($right) - $space, ' ').str_repeat(' ', $space).$right.Ansi::reset();
         if ($this->lastStatusBar !== $bar) {
@@ -462,8 +472,8 @@ final class Renderer {
 
         // Place cursor
         $cur = $this->windows[$this->activeIndex];
-        $cur->clampCursor($this->buf);
-        $cur->ensureCursorVisible($this->buf);
+        $cur->clampCursor($cur->buffer);
+        $cur->ensureCursorVisible($cur->buffer);
         $cursorRowOnScreen = $cur->topRow + ($cur->cursorRow - $cur->scrollTop);
         $cursorColOnScreen = 1 + max(0, $cur->cursorCol - $cur->hscroll);
         $out .= Ansi::move($cursorRowOnScreen, $cursorColOnScreen).Ansi::showCursor();
@@ -635,8 +645,8 @@ final class Editor {
     public function __construct(Terminal $term, Buffer $buf) {
         $this->term = $term; $this->buf = $buf;
         $h = $term->rows - 1; $w = $term->cols;
-        $this->wins = [new Window(1, $h, $w)];
-        $this->renderer = new Renderer($term, $buf, $this->wins);
+        $this->wins = [new Window(1, $h, $w, $buf)];
+        $this->renderer = new Renderer($term, $this->wins);
         $this->input = new Input();
         $this->snapshot();
     }
@@ -1447,7 +1457,9 @@ final class Editor {
             @touch($path);
         }
         // Carica nel buffer
-        $this->buf->loadFile($path);
+        // Sostituisci il buffer solo nella finestra attiva (indipendenza tra pane)
+        $this->wins[$this->active]->buffer = new Buffer($path);
+        $this->buf = $this->wins[$this->active]->buffer;
         // Reset finestra
         $w=$this->activeWin(); $w->cursorRow=0; $w->cursorCol=0; $w->scrollTop=0; $w->hscroll=0;
         $this->snapshot();
@@ -1554,13 +1566,13 @@ final class Editor {
 
     private function splitHorizontal(): void {
         if (count($this->wins) === 1) {
-            $this->wins[] = new Window(1, 1, $this->term->cols);
+            $this->wins[] = new Window(1, 1, $this->term->cols, $this->wins[$this->active]->buffer);
         }
         $this->setStatus('Split');
     }
 
     private function otherWindow(): void {
-        if (count($this->wins) > 1) { $this->active = 1 - $this->active; }
+        if (count($this->wins) > 1) { $this->active = 1 - $this->active; $this->buf = $this->wins[$this->active]->buffer; }
     }
 
     // Ctrl+1: solo il pane attuale
@@ -1568,6 +1580,7 @@ final class Editor {
         if (count($this->wins) > 1) {
             $this->wins = [$this->wins[$this->active]];
             $this->active = 0;
+            $this->buf = $this->wins[0]->buffer;
         }
     }
 
@@ -1576,6 +1589,7 @@ final class Editor {
         if (count($this->wins) > 1) {
             array_splice($this->wins, $this->active, 1);
             $this->active = 0;
+            $this->buf = $this->wins[0]->buffer;
         }
     }
 }
