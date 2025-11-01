@@ -978,9 +978,9 @@ final class Editor {
         $w=$this->activeWin(); $row=$w->cursorRow; $n=$this->buf->lineCount();
         $found = $row;
         if ($dir < 0) {
-            for ($r=$row-1; $r>=0; $r--) { if (trim($this->buf->lines[$r]) === '') { $found = max(0,$r-1); break; } }
+            for ($r=$row-1; $r>=0; $r--) { if (trim($this->buf->lines[$r]) === '') { $found = $r; break; } }
         } else {
-            for ($r=$row+1; $r<$n; $r++) { if (trim($this->buf->lines[$r]) === '') { $found = min($n-1,$r+1); break; } }
+            for ($r=$row+1; $r<$n; $r++) { if (trim($this->buf->lines[$r]) === '') { $found = $r; break; } }
         }
         $w->cursorRow = $found; $w->cursorCol = 0; $w->ensureCursorVisible($this->buf);
         // recenter per velocità visiva
