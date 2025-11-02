@@ -655,6 +655,13 @@ final class Editor {
     private Renderer $renderer;
     private Input $input;
     private string $clipboard = '';
+    /** @var string[] */
+    private array $killRing = [];
+    private int $killRingMax = 50;
+    private ?int $yankRingIndex = null;
+    /** @var null|array{startRow:int,startCol:int,endRow:int,endCol:int} */
+    private ?array $lastYankRegion = null;
+    private bool $inYankCycle = false;
     private bool $ctrlXPrefix = false;
     private array $undoStack = [];
     private int $undoMax = 50;
@@ -765,8 +772,8 @@ final class Editor {
             $this->ctrlXPrefix = false;
             if ($type === Keys::CTRL && $val === 's') { $this->saveFile(); return null; }
             if ($type === Keys::CTRL && $val === 'c') { return $this->maybeQuit(); }
-			if ($type === Keys::CTRL && $val === 'f') { $this->findFile(); return null; }
-            if ($type === Keys::ASCII && $val === 'u') { $this->undo(); return null; }
+            if ($type === Keys::CTRL && $val === 'f') { $this->findFile(); return null; }
+            if ($type === Keys::ASCII && $val === 'u') { if ($this->inYankCycle) { $this->yankPop(true); } else { $this->undo(); } return null; }
             if ($type === Keys::ASCII && $val === '2') { $this->splitHorizontal(); return null; }
             if ($type === Keys::ASCII && $val === 'o') { $this->otherWindow(); return null; }
             if ($type === Keys::ASCII && $val === '1') { $this->makeOnlyThisWindow(); return null; }
@@ -792,11 +799,13 @@ final class Editor {
         if ($type === Keys::ALT && ($val === 'f' || $val === 'F')) { $this->forwardWord(); return null; }
         if ($type === Keys::ALT && $val === 'i') { $this->indentRegion(); return null; }
         if ($type === Keys::ALT && $val === '/') { $this->autocomplete(); return null; }
+        if ($type === Keys::ALT && ($val === 'y' || $val === 'Y')) { $this->yankPop(false); return null; }
         // Ctrl+Alt+f / Ctrl+Alt+b per saltare tra parentesi corrispondenti
         if ($type === Keys::ALT && $val === "\x06") { $this->jumpToMatchingBracketForward(); return null; } // M-C-f
         if ($type === Keys::ALT && $val === "\x02") { $this->jumpToMatchingBracketBackward(); return null; } // M-C-b
         // ESC ESC ESC cancella mark come in Emacs
         if ($type === Keys::ASCII && $val === "\x1b") { $this->escCount = ($this->escCount ?? 0) + 1; if ($this->escCount >= 3) { $w->hasMark = false; $this->escCount = 0; $this->setStatus(''); } return null; } else { $this->escCount = 0; }
+        // (C-u) removed: use C-x u for undo or forward yank-pop when in yank cycle
 
         switch ($type) {
             case Keys::ARROW:
@@ -972,30 +981,32 @@ final class Editor {
     }
 
     private function killWordForward(): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
         $w=$this->activeWin(); $row=$w->cursorRow; $col=$w->cursorCol; $line = $this->buf->lines[$row] ?? '';
         $i = $col; $n = strlen($line);
         while ($i < $n && !$this->isWordChar($line[$i])) $i++;
         while ($i < $n && $this->isWordChar($line[$i])) $i++;
         $kill = substr($line, $col, $i-$col);
-        $this->clipboard = $kill;
+        $this->clipboard = $kill; $this->pushKillRing($kill);
         $this->buf->lines[$row] = substr($line, 0, $col).substr($line, $i);
         $this->buf->dirty = true;
+        $this->inYankCycle = false; $this->lastYankRegion = null; $this->yankRingIndex = null;
     }
 
     private function backwardKillWord(): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
         $w=$this->activeWin(); $row=$w->cursorRow; $col=$w->cursorCol; $line = $this->buf->lines[$row] ?? '';
         $i = $col;
         while ($i > 0 && !$this->isWordChar($line[$i-1])) $i--;
         while ($i > 0 && $this->isWordChar($line[$i-1])) $i--;
         $kill = substr($line, $i, $col-$i);
-        $this->clipboard = $kill;
+        $this->clipboard = $kill; $this->pushKillRing($kill);
         $this->buf->lines[$row] = substr($line, 0, $i).substr($line, $col);
         $w->cursorCol = $i;
         $this->buf->dirty = true;
+        $this->inYankCycle = false; $this->lastYankRegion = null; $this->yankRingIndex = null;
     }
 
     private function recenter(): void {
@@ -1140,11 +1151,12 @@ final class Editor {
     }
 
     private function killRegion(): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
         $w=$this->activeWin(); $rg = $this->regionText($w);
         if (!$rg) { $this->setStatus('No selection'); return; }
         [$a,$b,$lines] = $rg; $this->clipboard = implode("\n", $lines);
+        $this->pushKillRing($this->clipboard);
         // Delete region
         if ($a[0] === $b[0]) {
             $line = $this->buf->lines[$a[0]];
@@ -1158,18 +1170,21 @@ final class Editor {
         $w->cursorRow = $a[0]; $w->cursorCol = $a[1];
         $w->hasMark = false; $this->buf->dirty = true;
         $this->setStatus('Killed');
+        $this->inYankCycle = false; $this->lastYankRegion = null; $this->yankRingIndex = null;
     }
 
     private function yank(): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
-        if ($this->clipboard === '') { $this->setStatus('Clipboard empty'); return; }
+        $text = $this->killRing[0] ?? $this->clipboard;
+        if ($text === '') { $this->setStatus('Clipboard empty'); return; }
         $w=$this->activeWin(); $row=$w->cursorRow; $col=$w->cursorCol;
-        $lines = explode("\n", $this->clipboard);
+        $lines = explode("\n", $text);
         if (count($lines) === 1) {
             $line = $this->buf->lines[$row];
             $this->buf->lines[$row] = substr($line, 0, $col).$lines[0].substr($line, $col);
             $w->cursorCol = $col + strlen($lines[0]);
+            $this->lastYankRegion = ['startRow'=>$row,'startCol'=>$col,'endRow'=>$row,'endCol'=>$w->cursorCol];
         } else {
             $line = $this->buf->lines[$row];
             $first = substr($line, 0, $col).$lines[0];
@@ -1179,9 +1194,63 @@ final class Editor {
             $newLines = array_merge([$first], $mid, [$end.$last]);
             array_splice($this->buf->lines, $row, 1, $newLines);
             $w->cursorRow = $row + count($newLines)-1; $w->cursorCol = strlen($end);
+            $this->lastYankRegion = ['startRow'=>$row,'startCol'=>$col,'endRow'=>$w->cursorRow,'endCol'=>$w->cursorCol];
         }
         $this->buf->dirty = true;
-        $this->setStatus('Yanked');
+        $this->inYankCycle = true; $this->yankRingIndex = 0; $this->setStatus('Yanked');
+    }
+
+    private function pushKillRing(string $text): void {
+        if ($text === '') return;
+        array_unshift($this->killRing, $text);
+        if (count($this->killRing) > $this->killRingMax) { array_pop($this->killRing); }
+    }
+
+    private function yankPop(bool $forward): void {
+        if (!$this->inYankCycle || $this->lastYankRegion === null || $this->killRing === []) { $this->setStatus('Yank-pop only after yank'); return; }
+        $count = count($this->killRing);
+        if ($count <= 1) { return; }
+        $idx = $this->yankRingIndex ?? 0;
+        $idx = $forward ? ($idx - 1 + $count) % $count : ($idx + 1) % $count;
+        $this->replaceLastYankWith($this->killRing[$idx]);
+        $this->yankRingIndex = $idx; $this->inYankCycle = true; $this->setStatus('Yank-pop');
+    }
+
+    private function replaceLastYankWith(string $text): void {
+        $w = $this->activeWin();
+        $aRow = $this->lastYankRegion['startRow']; $aCol = $this->lastYankRegion['startCol'];
+        $bRow = $this->lastYankRegion['endRow']; $bCol = $this->lastYankRegion['endCol'];
+        // Delete existing region
+        if ($aRow === $bRow) {
+            $line = $this->buf->lines[$aRow];
+            $this->buf->lines[$aRow] = substr($line, 0, $aCol).substr($line, $bCol);
+            $w->cursorRow = $aRow; $w->cursorCol = $aCol;
+        } else {
+            $first = substr($this->buf->lines[$aRow], 0, $aCol);
+            $last = substr($this->buf->lines[$bRow], $bCol);
+            $newFirst = $first.$last;
+            array_splice($this->buf->lines, $aRow, $bRow-$aRow+1, [$newFirst]);
+            $w->cursorRow = $aRow; $w->cursorCol = $aCol;
+        }
+        // Insert new text at cursor (like yank)
+        $row = $w->cursorRow; $col = $w->cursorCol; $lines = explode("\n", $text);
+        if (count($lines) === 1) {
+            $line = $this->buf->lines[$row];
+            $this->buf->lines[$row] = substr($line, 0, $col).$lines[0].substr($line, $col);
+            $w->cursorCol = $col + strlen($lines[0]);
+            $this->lastYankRegion = ['startRow'=>$row,'startCol'=>$col,'endRow'=>$row,'endCol'=>$w->cursorCol];
+        } else {
+            $line = $this->buf->lines[$row];
+            $first = substr($line, 0, $col).$lines[0];
+            $last = substr($line, $col);
+            $mid = array_slice($lines, 1, -1);
+            $end = end($lines);
+            $newLines = array_merge([$first], $mid, [$end.$last]);
+            array_splice($this->buf->lines, $row, 1, $newLines);
+            $w->cursorRow = $row + count($newLines)-1; $w->cursorCol = strlen($end);
+            $this->lastYankRegion = ['startRow'=>$row,'startCol'=>$col,'endRow'=>$w->cursorRow,'endCol'=>$w->cursorCol];
+        }
+        $this->buf->dirty = true;
     }
 
     private function indentRegion(): void {
