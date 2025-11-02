@@ -15,7 +15,7 @@ This is a minimal, for-fun clone of some Emacs editing vibes written in PHP. It 
 - **Syntax color**: simple highlighter for PHP, JS, and HTML (tags/attrs), numbers, strings, comments.
 - **Status bar**: file name, modified flag, and cursor position.
 - **Incremental search**: Emacs-style `I-Search` with live updates.
-- **Selections and kill ring-ish**: set mark, kill region, yank.
+- **Selections & kill ring**: set mark, kill region, yank; `M-y` to cycle (yank-pop).
 - **Window splits**: basic horizontal split (2 panes) with quick toggle.
 - **Smart indent**: tab-based indentation, block-aware newline.
 - **Bracket jumps**: jump to matching bracket forward/backward.
@@ -82,9 +82,11 @@ If you pass a path that doesn’t exist, pemacs will create the file on save. It
 | `Tab` | Indent current line or selected region |
 | `Backspace` / `Del` | Delete backward/forward |
 | `C-SPC` | Toggle mark (start/stop selection) |
-| `C-w` | Kill region (copy + delete) |
-| `C-y` | Yank (paste) |
-| `M-d` / `M-Backspace` | Kill word forward/backward |
+| `C-w` | Kill region (copy + delete; pushes to kill ring) |
+| `C-y` | Yank (paste last kill; starts yank cycle) |
+| `M-y` | Yank-pop (cycle backward through kill ring) |
+| `C-x u` | Undo — or, if in a yank cycle, yank-pop forward |
+| `M-d` / `M-Backspace` | Kill word forward/backward (also push to kill ring) |
 | `C-x u` | Undo (simple snapshot-based) |
 | `ESC ESC ESC` | Cancel selection (like Emacs) |
 
@@ -99,6 +101,7 @@ If you pass a path that doesn’t exist, pemacs will create the file on save. It
 Notes:
 - Mark + region are shown with reverse video.
 - Tabs are visualized as single spaces for rendering, but indentation uses real tabs.
+- Kill ring keeps the most recent cuts (default depth 50). After a `C-y`, use `M-y` to rotate the pasted text; `C-x u` rotates in the other direction while in a yank cycle.
 
 ### Find File mini-picker 📁
 - Inline list opens above the status bar.
