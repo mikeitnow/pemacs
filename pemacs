@@ -866,6 +866,11 @@ final class Editor {
                     $w->cursorRow = min(max(0, $w->cursorRow + $moved), max(0,$w->buffer->lineCount()-1));
                     $line = $w->buffer->lines[$w->cursorRow] ?? '';
                     $w->cursorCol = min($w->cursorCol, strlen($line));
+                    // If mark is active and we are at end-of-buffer, extend selection to end of last line
+                    if ($w->hasMark && $w->cursorRow === $w->buffer->lineCount()-1) {
+                        $last = $w->buffer->lines[$w->cursorRow] ?? '';
+                        $w->cursorCol = strlen($last);
+                    }
                     return null;
                 }
                 if ($val === 'tab') { $this->indentCurrentOrRegion(); return null; }
@@ -965,7 +970,15 @@ final class Editor {
         } elseif ($dir === 'up') {
             if ($w->cursorRow > 0) { $w->cursorRow--; $w->cursorCol = min($w->cursorCol, strlen($this->buf->lines[$w->cursorRow])); }
         } elseif ($dir === 'down') {
-            if ($w->cursorRow < $this->buf->lineCount()-1) { $w->cursorRow++; $w->cursorCol = min($w->cursorCol, strlen($this->buf->lines[$w->cursorRow])); }
+            if ($w->cursorRow < $this->buf->lineCount()-1) {
+                $w->cursorRow++; $w->cursorCol = min($w->cursorCol, strlen($this->buf->lines[$w->cursorRow]));
+            } else {
+                // When at end-of-buffer with an active mark, extend selection to end of last line
+                if ($w->hasMark) {
+                    $last = $this->buf->lines[$w->cursorRow] ?? '';
+                    $w->cursorCol = strlen($last);
+                }
+            }
         }
     }
 
