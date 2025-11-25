@@ -370,6 +370,7 @@ final class Renderer {
     /** @var array<int,?array{start:int,len:int,seg:string}> overlay selezione per riga schermo */
     private array $lastSelSeg = [];
     private string $lastStatusBar = '';
+    private string $topOverlay = '';
 
     public function __construct(Terminal $term, array $windows) {
         $this->term = $term; $this->windows = $windows;
@@ -379,6 +380,7 @@ final class Renderer {
     public function setStatus(string $msg): void { $this->statusMsg = $msg; }
     public function activeIndex(): int { return $this->activeIndex; }
     public function invalidate(): void { $this->lastLineContent = []; $this->lastSelSeg = []; $this->lastStatusBar = ''; }
+    public function setTopOverlay(string $msg): void { $this->topOverlay = $msg; $this->invalidate(); }
 
     public function draw(): void {
         $this->term->querySize();
@@ -393,15 +395,16 @@ final class Renderer {
             $lower = $this->windows[1];
             $half = intdiv($totalRows - 1, 2);
             $upper->topRow = 1; $upper->height = max(1, $half-1); $upper->width = $cols;
-            // linea separatrice
+            // separator line
             $sepRow = 1 + $upper->height;
             $lower->topRow = $sepRow + 1; $lower->height = ($totalRows - 1) - $upper->height - 1; $lower->width = $cols;
             $this->windows = [$upper, $lower];
         }
 
         $out = Ansi::hideCursor();
+        // (top overlay will be drawn at the end so it stays over the first line)
         foreach ($this->windows as $wi => $w) {
-            // Draw text area (differenziale per riga)
+            // Draw text area (diff-aware per-row redraw)
             for ($r = 0; $r < $w->height; $r++) {
                 $screenRow = $w->topRow + $r;
                 $bufRow = $w->scrollTop + $r;
@@ -419,7 +422,7 @@ final class Renderer {
                     $updatedBase = true;
                 }
 
-                // Overlay selezione: applica solo se cambiata oppure se la base è stata aggiornata
+                // Selection overlay: apply only when changed or base line updated
                 $selInfo = null;
                 $sel = $w->selectionBounds();
                 if ($sel && $bufRow >= $sel[0][0] && $bufRow <= $sel[1][0]) {
@@ -455,9 +458,10 @@ final class Renderer {
                 $sepRow = $w->topRow + $w->height;
                 $buf = $w->buffer;
                 $status = ($buf->dirty ? '*' : '-') . ' ' . ($buf->filePath !== '' ? $buf->filePath : '[No Name]');
-                $pos = 'Ln '.($w->cursorRow+1).', Col '.($w->cursorCol+1);
-                $left = $status.'  '.($this->activeIndex === $wi && $this->statusMsg !== '' ? $this->statusMsg : '');
-                $right = $pos;
+                $percent = (int)round((($w->cursorRow+1) / max(1, $buf->lineCount())) * 100);
+                $pos = 'L '.($w->cursorRow+1).', C '.($w->cursorCol+1).' ('.$percent.'%)';
+                $left = $status.'  '.$pos.'  '.($this->activeIndex === $wi && $this->statusMsg !== '' ? $this->statusMsg : '');
+                $right = '';
                 $space = max(0, $this->term->cols - strlen($left) - strlen($right));
                 $sepBar = Ansi::color(Palette::activeStatus()).str_pad($left, $this->term->cols - strlen($right) - $space, ' ').str_repeat(' ', $space).$right.Ansi::reset();
                 $sepContent = $sepBar;
@@ -474,9 +478,11 @@ final class Renderer {
         $act = $this->windows[$bottomIdx];
         $buf = $act->buffer;
         $status = ($buf->dirty ? '*' : '-') . ' ' . ($buf->filePath !== '' ? $buf->filePath : '[No Name]');
-        $pos = 'Ln '.($act->cursorRow+1).', Col '.($act->cursorCol+1);
-        $right = $pos;
-        $left = $status.'  '.(($this->statusMsg !== '' && $this->activeIndex === $bottomIdx) ? $this->statusMsg : '');
+        $percent = (int)round((($act->cursorRow+1) / max(1, $buf->lineCount())) * 100);
+        $pos = 'L '.($act->cursorRow+1).', C '.($act->cursorCol+1).' ('.$percent.'%)';
+        // Emacs-like: position info near the left
+        $left = $status.'  '.$pos.'  '.(($this->statusMsg !== '' && $this->activeIndex === $bottomIdx) ? $this->statusMsg : '');
+        $right = '';
         $space = max(0, $this->term->cols - strlen($left) - strlen($right));
         $bar = Ansi::color(Palette::activeStatus()).str_pad($left, $this->term->cols - strlen($right) - $space, ' ').str_repeat(' ', $space).$right.Ansi::reset();
         if ($this->lastStatusBar !== $bar) {
@@ -490,18 +496,27 @@ final class Renderer {
         $cur->ensureCursorVisible($cur->buffer);
         $cursorRowOnScreen = $cur->topRow + ($cur->cursorRow - $cur->scrollTop);
         $cursorColOnScreen = 1 + max(0, $cur->cursorCol - $cur->hscroll);
+        // Draw top overlay last, in overlay mode (does not change layout)
+        if ($this->topOverlay !== '') {
+            $msg = $this->topOverlay;
+            $right = '';
+            $left = $msg;
+            $space = max(0, $this->term->cols - strlen($left) - strlen($right));
+            $barTop = Ansi::color(Palette::activeStatus()).str_pad($left, $this->term->cols - strlen($right) - $space, ' ').str_repeat(' ', $space).$right.Ansi::reset();
+            $out .= Ansi::move(1, 1).Ansi::clearLine().$barTop;
+        }
         $out .= Ansi::move($cursorRowOnScreen, $cursorColOnScreen).Ansi::showCursor();
 
         fwrite(STDOUT, $out);
     }
 
-    // Prende una stringa con sequenze ANSI e restituisce una slice per colonne visive [start, start+width)
+    // Takes a string with ANSI sequences and returns a visual-column slice [start, start+width)
     private static function sliceAnsi(string $s, int $start, int $width): string {
         $out = ''; $vis = 0; $i = 0; $len = strlen($s);
         $collect = false; $end = $start + $width;
         while ($i < $len && $vis < $end) {
             $ch = $s[$i];
-            if ($ch === "\x1b") { // copia intera sequenza SGR senza contare colonne
+            if ($ch === "\x1b") { // copy whole SGR sequence without counting columns
                 $m = null;
                 if (preg_match('/\x1b\[[0-9;]*m/', substr($s, $i), $m)) {
                     if ($vis >= $start) { $out .= $m[0]; }
@@ -529,7 +544,7 @@ final class Input {
     private ?array $pending = null; // for Ctrl-x prefix handling
 
     public function readKey(): array {
-        // Redraw request after SIGCONT: fa uscire subito per permettere il redraw
+        // Redraw request after SIGCONT: exit immediately to allow redraw
         if (($GLOBALS['__pemacs_sigcont'] ?? false) === true) { return [Keys::SPECIAL, 'sigcont']; }
         // Wait for a byte
         $c = fread(STDIN, 1);
@@ -539,9 +554,9 @@ final class Input {
             $c = fread(STDIN, 1);
         }
 
-        // Enter prima, per evitare che CR venga interpretato come Ctrl+M
+        // Handle Enter first to avoid CR being interpreted as Ctrl+M
         if ($c === "\r" || $c === "\n") return [Keys::SPECIAL, 'enter'];
-        // Tab prima dei CTRL (altrimenti diventa Ctrl+i)
+        // Handle Tab before CTRL (otherwise it becomes Ctrl+i)
         if ($c === "\t") return [Keys::SPECIAL, 'tab'];
 
         $ord = ord($c);
@@ -569,7 +584,7 @@ final class Input {
             }
             // Home/End alternate forms: ESC [ H / ESC [ F, or ESC O H / ESC O F
             if (preg_match('/\x1b\[(H|F)/', $seq, $m)) { return [Keys::SPECIAL, $m[1]==='H' ? 'home' : 'end']; }
-            // CSI 1;5H/1;5F etc (con modificatori)
+            // CSI 1;5H/1;5F etc (with modifiers)
             if (preg_match('/\x1b\[(?:1;\d+)(H|F)/', $seq, $m)) { return [Keys::SPECIAL, $m[1]==='H' ? 'home' : 'end']; }
             if (preg_match('/\x1bO(H|F)/', $seq, $m)) { return [Keys::SPECIAL, $m[1]==='H' ? 'home' : 'end']; }
             // Arrows with optional modifiers: ESC [ 1 ; 5 A  (Ctrl+Up), etc.
@@ -598,7 +613,7 @@ final class Input {
         return [Keys::ASCII, ''];
     }
 
-    // Non-blocking: restituisce null se non c'è input immediatamente disponibile
+    // Non-blocking: returns null when no input is immediately available
     public function readKeyNow(): ?array {
         if (($GLOBALS['__pemacs_sigcont'] ?? false) === true) { return [Keys::SPECIAL, 'sigcont']; }
         $c = fread(STDIN, 1);
@@ -669,6 +684,7 @@ final class Editor {
     private ?string $lastSearch = null; // last query
     private int $lastSearchRow = 0; // next start row for repeat
     private int $lastSearchCol = 0; // next start col for repeat
+    private bool $overlayDismissOnKey = false;
 
     public function __construct(Terminal $term, Buffer $buf) {
         $this->term = $term; $this->buf = $buf;
@@ -690,7 +706,7 @@ final class Editor {
             'cursorCol' => $this->activeWin()->cursorCol,
             'scrollTop' => $this->activeWin()->scrollTop,
             'hscroll' => $this->activeWin()->hscroll,
-            // Memorizza la posizione dell'ultima modifica (post-edit)
+            // Remember the last edit position (post-edit)
             'lastEditRow' => $this->activeWin()->cursorRow,
             'lastEditCol' => $this->activeWin()->cursorCol,
         ];
@@ -700,20 +716,15 @@ final class Editor {
 
     private function undo(): void {
         if (count($this->undoStack) <= 1) { $this->setStatus('Nothing to undo'); return; }
-        // Con snapshot pre-edit: poppa l'ultimo snapshot e ripristina
+        // With pre-edit snapshot: pop last snapshot and restore
         $state = array_pop($this->undoStack);
-        // Ripristina buffer e stato cursore
+        // Restore buffer and cursor state
         $this->buf->lines = $state['lines'] ?? $this->buf->lines;
         $this->buf->dirty = $state['dirty'] ?? $this->buf->dirty;
         $w = $this->activeWin();
-        // Posiziona il cursore esattamente dove era nello snapshot ripristinato
-        $row = min(max(0, (int)($state['cursorRow'] ?? 0)), max(0, $this->buf->lineCount()-1));
-        $line = $this->buf->lines[$row] ?? '';
-        $col = min(max(0, (int)($state['cursorCol'] ?? 0)), strlen($line));
-        $w->cursorRow = $row; $w->cursorCol = $col;
-        // Centra la vista sul cursore dopo il ripristino
+        // Center view around the cursor after restore
         $this->recenter();
-        // Nessun push: lo stack ora punta allo stato precedente, permettendo ulteriori undo
+        // No push: the stack now points to the previous state, allowing further undos
     }
 
     private function setStatus(string $msg): void { $this->renderer->setStatus($msg); }
@@ -723,17 +734,17 @@ final class Editor {
         $this->renderer->draw();
         while (true) {
             if (($GLOBALS['__pemacs_sigcont'] ?? false) === true) {
-                // Reinizializza modalità raw e schermo alternativo fuori dal signal handler
+                // Re-enter raw mode and alternate screen outside the signal handler
                 $this->term->rawSafe();
                 fwrite(STDOUT, Ansi::clear());
                 usleep(20000);
-                // Reimposta lettura non bloccante su STDIN (alcuni terminali la perdono dopo fg)
+                // Reapply non-blocking on STDIN (some terminals lose it after fg)
                 @stream_set_blocking(STDIN, false);
-                // Svuota eventuale input accumulato (sequenze digitate mentre era sospeso)
+                // Drain any accumulated input (keys pressed while suspended)
                 while (true) {
                     $chunk = @fread(STDIN, 4096);
                     if ($chunk === '' || $chunk === false) { break; }
-                    // continua a svuotare fino a buffer vuoto
+                    // keep draining until buffer is empty
                 }
                 $this->term->querySize();
                 $this->renderer->invalidate();
@@ -742,6 +753,12 @@ final class Editor {
                 $GLOBALS['__pemacs_sigcont'] = false;
             }
             $key = $this->input->readKey();
+            if (($this->overlayDismissOnKey ?? false) === true) {
+                $this->overlayDismissOnKey = false;
+                $this->renderer->setTopOverlay('');
+                $this->renderer->setStatus('');
+                $this->renderer->draw();
+            }
             $handled = $this->dispatchKey($key);
             if ($handled === 'quit') { break; }
 
@@ -800,10 +817,12 @@ final class Editor {
         if ($type === Keys::ALT && $val === 'i') { $this->indentRegion(); return null; }
         if ($type === Keys::ALT && $val === '/') { $this->autocomplete(); return null; }
         if ($type === Keys::ALT && ($val === 'y' || $val === 'Y')) { $this->yankPop(false); return null; }
+        // Alias: Ctrl+u behaves like C-x u (undo; or yank-pop forward if in yank cycle)
+        if ($type === Keys::CTRL && $val === 'u') { if ($this->inYankCycle) { $this->yankPop(true); } else { $this->undo(); } return null; }
         // Ctrl+Alt+f / Ctrl+Alt+b per saltare tra parentesi corrispondenti
         if ($type === Keys::ALT && $val === "\x06") { $this->jumpToMatchingBracketForward(); return null; } // M-C-f
         if ($type === Keys::ALT && $val === "\x02") { $this->jumpToMatchingBracketBackward(); return null; } // M-C-b
-        // ESC ESC ESC cancella mark come in Emacs
+        // ESC ESC ESC clears mark (like Emacs)
         if ($type === Keys::ASCII && $val === "\x1b") { $this->escCount = ($this->escCount ?? 0) + 1; if ($this->escCount >= 3) { $w->hasMark = false; $this->escCount = 0; $this->setStatus(''); } return null; } else { $this->escCount = 0; }
         // (C-u) removed: use C-x u for undo or forward yank-pop when in yank cycle
 
@@ -829,7 +848,7 @@ final class Editor {
                     if ($newTop > $maxStart) { $newTop = $maxStart; }
                     $moved = $newTop - $oldTop; // negative or zero
                     $w->scrollTop = $newTop;
-                    // Mantieni il cursore sulla stessa riga dello schermo
+                    // Keep cursor on the same screen row
                     $w->cursorRow = min(max(0, $w->cursorRow + $moved), max(0,$w->buffer->lineCount()-1));
                     $line = $w->buffer->lines[$w->cursorRow] ?? '';
                     $w->cursorCol = min($w->cursorCol, strlen($line));
@@ -842,7 +861,7 @@ final class Editor {
                     $newTop = min($maxStart, $oldTop + $delta);
                     $moved = $newTop - $oldTop; // positive or zero
                     $w->scrollTop = $newTop;
-                    // Mantieni il cursore sulla stessa riga dello schermo
+                    // Keep cursor on the same screen row
                     $w->cursorRow = min(max(0, $w->cursorRow + $moved), max(0,$w->buffer->lineCount()-1));
                     $line = $w->buffer->lines[$w->cursorRow] ?? '';
                     $w->cursorCol = min($w->cursorCol, strlen($line));
@@ -878,7 +897,7 @@ final class Editor {
     }
 
     private function backspace(): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
         $w = $this->activeWin(); $row=$w->cursorRow; $col=$w->cursorCol;
         if ($col > 0) {
@@ -898,7 +917,7 @@ final class Editor {
     }
 
     private function deleteForward(): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
         $w=$this->activeWin(); $row=$w->cursorRow; $col=$w->cursorCol;
         $line = $this->buf->lines[$row];
@@ -914,7 +933,7 @@ final class Editor {
     }
 
     private function newlineWithIndent(): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
         $w=$this->activeWin(); $row=$w->cursorRow; $col=$w->cursorCol;
         $line = $this->buf->lines[$row];
@@ -1051,10 +1070,10 @@ final class Editor {
         if ($c !== null && isset($opens[$c])) { $startChar = $c; $startCol = $col; }
         elseif ($cPrev !== null && isset($opens[$cPrev])) { $startChar = $cPrev; $startCol = $col-1; }
         else {
-            // Allarga: cerca un'aperta visibile a sinistra sulla stessa riga
+            // Widen: look for an opening bracket to the left on the same line
             $k = $col-1; while ($k >= 0 && ($line[$k] === ' ' || $line[$k] === "\t")) { $k--; }
             if ($k >= 0 && isset($opens[$line[$k]])) { $startChar = $line[$k]; $startCol = $k; }
-            // Se non trovata e siamo a inizio riga, guarda la riga precedente
+            // If not found and at line start, check the previous line
             if ($startChar === null && $col === 0 && $row > 0) {
                 $pl = $this->buf->lines[$row-1]; $k = strlen($pl) - 1;
                 while ($k >= 0 && ($pl[$k] === ' ' || $pl[$k] === "\t")) { $k--; }
@@ -1254,14 +1273,14 @@ final class Editor {
     }
 
     private function indentRegion(): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
         $w=$this->activeWin(); $sel = $w->selectionBounds();
         if (!$sel) { $this->setStatus('No selection'); return; }
         [$a,$b] = $sel;
         for ($r=$a[0]; $r<=$b[0]; $r++) {
             $line = $this->buf->lines[$r];
-            // Indenta come Emacs: porta la riga all'indent desiderato
+            // Indent like Emacs: move the line to the desired indent
             $desired = $this->desiredIndentForRow($r);
             // Costruisci prefisso di TAB
             $prefix = str_repeat("\t", max(0, $desired));
@@ -1276,7 +1295,7 @@ final class Editor {
     }
 
     private function indentCurrentOrRegion(): void {
-        // Snapshot prima della modifica
+        // Snapshot before modification
         $this->snapshot();
         $w=$this->activeWin();
         $sel = $w->selectionBounds();
@@ -1290,7 +1309,7 @@ final class Editor {
     }
 
     private function desiredIndentForRow(int $row): int {
-        // Conta solo graffe { } fino alla riga precedente, ignorando stringhe e commenti
+        // Count only braces { } up to the previous line, ignoring strings and comments
         $depth = 0; $inStr = null; $escaped = false; $inLineComment = false;
         for ($r = 0; $r < $row; $r++) {
             $ln = $this->buf->lines[$r] ?? '';
@@ -1322,7 +1341,7 @@ final class Editor {
         $line = max(1, (int)$num); $line = min($line, $this->buf->lineCount());
         $w=$this->activeWin();
         $w->cursorRow = $line-1; $w->cursorCol = 0;
-        // centra la vista subito, non aspettare altri input
+        // center the view immediately; don't wait for further input
         $w->scrollTop = max(0, $w->cursorRow - intdiv($w->height,2));
         $this->renderer->setWindows($this->wins, $this->active);
         $this->renderer->draw();
@@ -1375,14 +1394,16 @@ final class Editor {
     }
 
 	private function filePrompt(string $cwd, string $initial = ''): ?string {
-		// Prompt in stile Emacs: path assoluto sul minibuffer, Tab per completare, doppio-Tab per lista, Alt+Backspace cancella parola precedente
+		// Emacs-style prompt: absolute path in minibuffer, Tab to complete, double-Tab to list, Alt+Backspace deletes previous "word"
 		$dir = realpath($cwd) ?: ($cwd ?: '/');
 		$input = $initial !== '' ? $initial : rtrim($dir, '/').'/';
 		$showList = false; $listAll = []; $baseDir = $dir; $prefix = '';
-		$listDir = $dir; // directory effettiva da cui è stata generata la lista
+		$listDir = $dir; // actual directory from which the list is generated
 		$selIndex = 0; $scroll = 0; $listAll = [];
 		$lastWasTab = false; $escCount = 0;
-		// All'avvio, mostra subito la lista come se avessimo premuto due volte Tab
+		// State to optimize list redraw
+		$prevSelIndex = 0; $prevScroll = 0; $prevRows = 0; $prevColsCount = 0; $prevStartRow = 0; $prevColWidth = 0;
+		// On start, show the list immediately (as if double-Tab)
 		$showList = true;
 		$in = $input;
 		$baseDir = ($in !== '' && ($in[0] === '/' || $in[0] === '~')) ? '' : $dir;
@@ -1411,35 +1432,84 @@ final class Editor {
 		while (true) {
 			$this->renderer->setStatus('Find file: '.$input);
 			$this->renderer->draw();
-			// Disegna lista multi-colonna con scrolling (doppio-Tab)
+			// Draw multi-column list with scrolling (double-Tab)
 			if ($showList) {
 				$rows = max(8, min($this->term->rows - 2, intdiv($this->term->rows - 1, 2)));
 				$startRow = $this->term->rows - 1 - $rows;
-				// Calcola larghezze e numero colonne
+				// Calculate widths and number of columns
 				$maxLen = 0; foreach ($listAll as $nm) { $maxLen = max($maxLen, strlen($nm)); }
 				$minCol = 12; $maxCol = 40;
 				$colBase = max($minCol, min($maxCol, $maxLen + 2));
 				$colsCount = max(1, intdiv($this->term->cols, $colBase));
 				$colWidth = max(1, intdiv($this->term->cols, max(1,$colsCount)));
 				$pageSize = $rows * $colsCount;
-				// Assicura che l'elemento selezionato sia nella pagina visibile
+				// Ensure the selected element is inside the visible page
 				if ($selIndex < $scroll) { $scroll = intdiv($selIndex, $pageSize) * $pageSize; }
 				if ($selIndex >= $scroll + $pageSize) { $scroll = intdiv($selIndex, $pageSize) * $pageSize; }
-				for ($r=0; $r<$rows; $r++) {
-					$lineStr = '';
-					for ($c=0; $c<$colsCount; $c++) {
-						$idx = $scroll + $c*$rows + $r;
-						$label = $listAll[$idx] ?? '';
-						$isSel = ($idx === $selIndex);
-						$cell = str_pad($label, max(0, $colWidth));
-						$lineStr .= ($isSel ? Ansi::color(Palette::selection()) : '').$cell.($isSel ? Ansi::reset() : '');
+				$layoutChanged = ($prevRows !== $rows || $prevColsCount !== $colsCount || $prevStartRow !== $startRow || $prevColWidth !== $colWidth || $prevScroll !== $scroll);
+				if ($layoutChanged || $prevRows === 0) {
+					// Full redraw: separator + all rows
+					for ($clr=$startRow-1; $clr<=$this->term->rows-1; $clr++) { fwrite(STDOUT, Ansi::move($clr, 1).Ansi::clearLine()); }
+                // Separator bar (modeline style) above the list
+                $w = $this->activeWin(); $buf = $this->wins[$this->active]->buffer;
+                $status = ($buf->dirty ? '*' : '-') . ' ' . ($buf->filePath !== '' ? $buf->filePath : '[No Name]');
+                $percent = (int)round((($w->cursorRow+1) / max(1, $buf->lineCount())) * 100);
+                $pos = 'L '.($w->cursorRow+1).', C '.($w->cursorCol+1).' ('.$percent.'%)';
+                $left = $status.'  '.$pos; $right = ''; $space = max(0, $this->term->cols - strlen($left) - strlen($right));
+                $sepBar = Ansi::color(Palette::activeStatus()).str_pad($left, $this->term->cols - strlen($right) - $space, ' ').str_repeat(' ', $space).$right.Ansi::reset();
+					fwrite(STDOUT, Ansi::move($startRow-1, 1).Ansi::clearLine().$sepBar);
+					for ($r=0; $r<$rows; $r++) {
+						$lineStr = '';
+						for ($c=0; $c<$colsCount; $c++) {
+							$idx = $scroll + $c*$rows + $r;
+							$label = $listAll[$idx] ?? '';
+							$isSel = ($idx === $selIndex);
+							$cell = str_pad($label, max(0, $colWidth));
+							$lineStr .= ($isSel ? Ansi::color(Palette::selection()) : '').$cell.($isSel ? Ansi::reset() : '');
+						}
+						fwrite(STDOUT, Ansi::move($startRow + $r, 1).Ansi::clearLine().$lineStr);
 					}
-					fwrite(STDOUT, Ansi::move($startRow + $r, 1).Ansi::clearLine().$lineStr);
+					$prevRows = $rows; $prevColsCount = $colsCount; $prevStartRow = $startRow; $prevColWidth = $colWidth; $prevScroll = $scroll; $prevSelIndex = $selIndex;
+				} else {
+					// Partial redraw: only the row with old and new selection
+					$oldRow = ($prevSelIndex - $scroll) % $rows;
+					$newRow = ($selIndex - $scroll) % $rows;
+					$targets = array_unique(array_filter([$oldRow, $newRow], function($r) use ($rows){ return $r>=0 && $r<$rows; }));
+					foreach ($targets as $r) {
+						$lineStr = '';
+						for ($c=0; $c<$colsCount; $c++) {
+							$idx = $scroll + $c*$rows + $r;
+							$label = $listAll[$idx] ?? '';
+							$isSel = ($idx === $selIndex);
+							$cell = str_pad($label, max(0, $colWidth));
+							$lineStr .= ($isSel ? Ansi::color(Palette::selection()) : '').$cell.($isSel ? Ansi::reset() : '');
+						}
+						fwrite(STDOUT, Ansi::move($startRow + $r, 1).Ansi::clearLine().$lineStr);
+					}
+					$prevSelIndex = $selIndex;
+				}
+			} else {
+				// If the list is hidden, clear the list area and the separator line
+				$rows = max(8, min($this->term->rows - 2, intdiv($this->term->rows - 1, 2)));
+				$startRow = $this->term->rows - 1 - $rows;
+				for ($clr=$startRow-1; $clr<=$this->term->rows-1; $clr++) {
+					fwrite(STDOUT, Ansi::move($clr, 1).Ansi::clearLine());
 				}
 			}
 
 			$k = (new Input())->readKey();
 			[$t,$v] = $k; $handled = false;
+			// Handle resume from background while inside file prompt
+			if ($t === Keys::SPECIAL && $v === 'sigcont') {
+				$GLOBALS['__pemacs_sigcont'] = false;
+				$this->term->rawSafe();
+				fwrite(STDOUT, Ansi::clear());
+				@stream_set_blocking(STDIN, false);
+				$this->renderer->invalidate();
+				$this->renderer->setWindows($this->wins, $this->active);
+				$this->renderer->draw();
+				continue;
+			}
 			if ($t === Keys::SPECIAL && $v === 'enter') {
 				$path = '';
 				if ($showList && isset($listAll[$selIndex])) {
@@ -1449,13 +1519,13 @@ final class Editor {
 					$path = $input;
 				}
 				if ($path === '') { $lastWasTab = false; continue; }
-				// espandi tilde
+				// expand tilde
 				if ($path[0] === '~') { $home = getenv('HOME') ?: '/'; $path = $home.substr($path,1); }
 				if (is_dir($path)) {
 					$dir = realpath($path) ?: $path;
 					$input = rtrim($dir,'/').'/';
 					$baseDir = $dir;
-					// Ricostruisci subito la lista nella nuova directory (come doppio-Tab)
+					// Rebuild the list immediately in the new directory (like double-Tab)
 					$scanDir = $dir;
 					$cands = @scandir($scanDir) ?: [];
 					$cands = array_values(array_filter($cands, function($e){ return $e !== '.'; }));
@@ -1481,7 +1551,7 @@ final class Editor {
 				$showList = false; $lastWasTab = false; $handled = true;
 			}
 			if ($t === Keys::ALT && $v === 'backspace') {
-				// Cancella "parola" precedente (fino allo slash precedente)
+				// Delete previous "word" (up to previous slash)
 				$trim = rtrim($input, '/');
 				$slash = strrpos($trim, '/');
 				if ($slash === false) { $input = ''; }
@@ -1492,7 +1562,8 @@ final class Editor {
 				$input .= $v; $showList = false; $lastWasTab = false; $handled = true;
 			}
 			if ($t === Keys::SPECIAL && $v === 'tab') {
-				// Calcola baseDir e prefix in base all'input
+				$wasShowing = $showList;
+				// Calculate baseDir and prefix based on input
 				$in = $input;
 				$baseDir = ($in !== '' && ($in[0] === '/' || $in[0] === '~')) ? '' : $dir;
 				if ($in !== '' && $in[0] === '~') { $baseDir = getenv('HOME') ?: '/'; $in = substr($in,1); }
@@ -1512,16 +1583,16 @@ final class Editor {
 					return $da ? -1 : 1;
 				});
 				$matches = array_values(array_filter($cands, function($e) use ($prefix){ return $prefix === '' || strpos($e, $prefix) === 0; }));
-				// Se c'è un solo match, completa subito
+				// If there is a single match, complete immediately
 				if (count($matches) === 1) {
 					$single = $matches[0];
 					$head = ($slash !== false) ? substr($input, 0, strrpos($input,'/')+1) : '';
 					$input = $head.$single;
 					$abs = (($scanDir==='/'?'/':rtrim($scanDir,'/').'/').$single);
 					if (is_dir($abs)) { $input .= '/'; }
-					$showList = false; $lastWasTab = false;
+					$showList = $wasShowing; $lastWasTab = false;
 				} else if (count($matches) > 1) {
-					// Prova a estendere al longest common prefix
+					// Try to extend to the longest common prefix
 					$lcp = '';
 					for ($i=0; ; $i++) {
 						$ch = null; $same = true;
@@ -1535,25 +1606,25 @@ final class Editor {
 					if ($lcp !== '' && $lcp !== $prefix) {
 						$head = ($slash !== false) ? substr($input, 0, strrpos($input,'/')+1) : '';
 						$input = $head.$lcp;
-						$showList = false; $lastWasTab = false;
+						$showList = $wasShowing; $lastWasTab = false;
 					} else {
-						// Doppio-Tab: mostra lista
+						// Double-Tab: show the list
 						if ($lastWasTab) {
 						$showList = true;
 						$listAll = array_map(function($e) use ($scanDir){ return $e.(is_dir(($scanDir==='/'?'/':rtrim($scanDir,'/').'/').$e) ? '/' : ''); }, $matches);
 						$selIndex = 0; $scroll = 0; $listDir = $scanDir;
 						} else {
-							$showList = false;
+							$showList = $wasShowing; // do not hide if already visible
 						}
-						$lastWasTab = !$showList ? true : false; // resta true se non abbiamo mostrato
+						$lastWasTab = !$showList ? true : false; // stays true when we didn't show
 					}
 				} else {
-					// Nessun match: su doppio-Tab mostra la directory corrente
+					// No match: on double-Tab show the current directory
 					if ($lastWasTab) {
 						$showList = true;
 						$listAll = array_map(function($e) use ($scanDir){ return $e.(is_dir(($scanDir==='/'?'/':rtrim($scanDir,'/').'/').$e) ? '/' : ''); }, $cands);
 						$selIndex = 0; $scroll = 0; $listDir = $scanDir;
-					} else { $showList = false; }
+					} else { $showList = $wasShowing; }
 					$lastWasTab = !$showList ? true : false;
 				}
 				continue;
@@ -1591,11 +1662,11 @@ final class Editor {
             if (!is_dir($parent)) { $this->setStatus('Directory not found'); return; }
             @touch($path);
         }
-        // Carica nel buffer
-        // Sostituisci il buffer solo nella finestra attiva (indipendenza tra pane)
+        // Load into buffer
+        // Replace buffer only in the active window (pane independence)
         $this->wins[$this->active]->buffer = new Buffer($path);
         $this->buf = $this->wins[$this->active]->buffer;
-        // Reset finestra
+        // Reset window
         $w=$this->activeWin(); $w->cursorRow=0; $w->cursorCol=0; $w->scrollTop=0; $w->hscroll=0;
         $this->snapshot();
         $this->renderer->setWindows($this->wins, $this->active);
@@ -1605,7 +1676,7 @@ final class Editor {
     }
 
     private function saveFile(): void {
-        if ($this->buf->save()) { $this->setStatus('Saved ✅'); }
+        if ($this->buf->save()) { $this->setStatus('Saved ✅'); $this->renderer->setTopOverlay('Saved ✅'); $this->overlayDismissOnKey = true; $this->renderer->draw(); }
         else { $this->setStatus('Save error ❌'); }
     }
 
@@ -1629,7 +1700,7 @@ final class Editor {
         }
     }
 
-    // Incremental search (Ctrl+s): barra di ricerca nella status bar, aggiorna match live; ripetere Ctrl+s va al prossimo
+    // Incremental search (Ctrl+s): search bar in status bar, live updates; pressing Ctrl+s again goes to next match
     private function incrementalSearch(string $initialQuery = ''): void {
         $query = $initialQuery;
         $startPos = [$this->activeWin()->cursorRow, $this->activeWin()->cursorCol];
@@ -1638,28 +1709,35 @@ final class Editor {
         $this->renderer->setStatus('I-Search: ' . $query);
         $this->renderer->draw();
         if ($query !== '') {
-            // mostra la query esistente e posiziona sul primo match dall'origine
+            // show the existing query and move to the first match from origin
             $this->activeWin()->cursorRow = $originRow; $this->activeWin()->cursorCol = $originCol;
             $this->searchNext($query, false, true);
         }
+        $postAction = null; // callable-like via string flag
         while (true) {
             $k = (new Input())->readKey();
             [$t,$v] = $k;
             if (($t === Keys::SPECIAL && $v === 'enter') || ($t === Keys::ASCII && $v === "\x1b")) { break; }
             if ($t === Keys::CTRL && $v === 'g') { // abort
                 $w=$this->activeWin(); $w->cursorRow=$startPos[0]; $w->cursorCol=$startPos[1]; $this->renderer->setStatus(''); return; }
+            // Exit on movement keys and execute them after leaving search
+            if ($t === Keys::ARROW) { $postAction = ['type'=>'arrow','dir'=>$v]; break; }
+            if ($t === Keys::CTRL && $v === 'a') { $postAction = ['type'=>'cmd','name'=>'bol']; break; }
+            if ($t === Keys::CTRL && $v === 'e') { $postAction = ['type'=>'cmd','name'=>'eol']; break; }
+            if ($t === Keys::ALT && ($v === 'b' || $v === 'B')) { $postAction = ['type'=>'cmd','name'=>'backwardWord']; break; }
+            if ($t === Keys::ALT && ($v === 'f' || $v === 'F')) { $postAction = ['type'=>'cmd','name'=>'forwardWord']; break; }
             if ($t === Keys::CTRL && $v === 's') {
-                // Se la query è vuota e esiste una ricerca precedente, auto-inseriscila e cerca subito
+                // If the query is empty and a previous search exists, auto-insert and search immediately
                 if ($query === '' && ($this->lastSearch ?? '') !== '') {
                     $query = $this->lastSearch;
                     $this->renderer->setStatus('I-Search: '.$query);
                     $this->renderer->draw();
-                    // riparti dall'origine e trova il primo match
+                    // restart from origin and find the first match
                     $this->activeWin()->cursorRow = $originRow; $this->activeWin()->cursorCol = $originCol;
                     $this->searchNext($query, false, true);
                     continue;
                 }
-                // Altrimenti, ripeti la ricerca andando al prossimo match
+                // Otherwise, repeat search moving to the next match
                 $this->searchNext($query, true, true);
                 continue;
             }
@@ -1667,7 +1745,7 @@ final class Editor {
             elseif ($t === Keys::ASCII && $v !== '') { $query .= $v; }
             $this->renderer->setStatus('I-Search: '.$query);
             $this->renderer->draw();
-            // per ogni modifica della query, cerca partendo dall'origine iniziale
+            // after each query change, search from the original origin position
             $this->activeWin()->cursorRow = $originRow; $this->activeWin()->cursorCol = $originCol;
             $this->searchNext($query, false, true);
         }
@@ -1675,6 +1753,16 @@ final class Editor {
         $this->lastSearchRow = $this->activeWin()->cursorRow;
         $this->lastSearchCol = max(0, $this->activeWin()->cursorCol - strlen($query));
         $this->activeWin()->hasMark = false; $this->renderer->setStatus('');
+        // Execute any queued movement after exiting search
+        if ($postAction !== null) {
+            if ($postAction['type'] === 'arrow') { $this->moveCursor($postAction['dir']); }
+            else if ($postAction['type'] === 'cmd') {
+                if ($postAction['name'] === 'bol') { $this->moveBeginningOfLine(); }
+                else if ($postAction['name'] === 'eol') { $this->moveEndOfLine(); }
+                else if ($postAction['name'] === 'backwardWord') { $this->backwardWord(); }
+                else if ($postAction['name'] === 'forwardWord') { $this->forwardWord(); }
+            }
+        }
     }
 
     private function searchNext(string $query, bool $fromAfter, bool $select=false): void {
@@ -1690,8 +1778,8 @@ final class Editor {
                 if ($pos !== false) {
                     if ($select) { $w->hasMark = true; $w->markRow = $r; $w->markCol = $pos; $w->cursorRow = $r; $w->cursorCol = $pos + strlen($query); }
                     else { $w->cursorRow = $r; $w->cursorCol = $pos; }
-                    $w->ensureCursorVisible($this->buf);
-                    $this->renderer->setWindows($this->wins, $this->active); $this->renderer->draw();
+                    // Center view around the new cursor position (like Ctrl+l)
+                    $this->recenter();
                     return;
                 }
             }
@@ -1719,7 +1807,7 @@ final class Editor {
         }
     }
 
-    // Ctrl+0: chiudi il pane attuale
+    // Ctrl+0: close current pane
     private function closeCurrentWindow(): void {
         if (count($this->wins) > 1) {
             array_splice($this->wins, $this->active, 1);
@@ -1730,29 +1818,29 @@ final class Editor {
 }
 
 // ---- Bootstrap ----
-// Supporto a -q (quit immediato dopo il caricamento)
+// Supporto a -q (quit immediately after loading)
 $args = $argv; array_shift($args);
 $quitImmediately = false; $fileArg = '';
 foreach ($args as $a) { if ($a === '-q') { $quitImmediately = true; } else if ($fileArg === '') { $fileArg = $a; } }
 $term = new Terminal();
 $buffer = new Buffer($fileArg);
 $editor = new Editor($term, $buffer);
-// Gestione segnali: assicura ripristino pulito anche su SIGINT/SIGTERM/SIGHUP/SIGQUIT
+// Signal handling: ensure clean restore on SIGINT/SIGTERM/SIGHUP/SIGQUIT
 if (function_exists('pcntl_signal')) {
     $handler = function(int $sig) use ($term) {
         $term->restore();
         fwrite(STDOUT, Ansi::clear()); fflush(STDOUT);
-        // Esci con codice che indica segnale
+        // Exit with code indicating signal
         exit(128 + $sig);
     };
     @pcntl_signal(SIGINT, $handler);
     @pcntl_signal(SIGTERM, $handler);
     @pcntl_signal(SIGHUP, $handler);
     @pcntl_signal(SIGQUIT, $handler);
-    // Ctrl+Z support: su SIGTSTP ripristina terminale e poi sospendi davvero; su SIGCONT rientra in raw e ridisegna
+    // Ctrl+Z support: on SIGTSTP restore terminal then actually suspend; on SIGCONT re-enter raw and redraw
     $tstpHandler = function(int $sig) use ($term) {
         $term->restore();
-        // Passa all'azione di default (sospensione): reimposta handler default e re-invia segnale
+        // Pass to default action (suspension): reset default handler and re-send signal
         if (function_exists('pcntl_signal')) { @pcntl_signal(SIGTSTP, SIG_DFL); }
         if (function_exists('posix_kill')) { @posix_kill(getmypid(), SIGTSTP); }
         else { @shell_exec('kill -TSTP '.getmypid()); }
@@ -1760,18 +1848,18 @@ if (function_exists('pcntl_signal')) {
     $GLOBALS['__pemacs_tstp_handler'] = $tstpHandler;
     @pcntl_signal(SIGTSTP, $tstpHandler);
     $contHandler = function(int $sig) use ($term) {
-        // Solo segnala; la re-inizializzazione raw avverrà nel main loop
-        // Reinstalla handler SIGTSTP
+        // Just signal; re-initialization raw will happen in main loop
+        // Reinstall handler SIGTSTP
         if (function_exists('pcntl_signal') && isset($GLOBALS['__pemacs_tstp_handler'])) {
             @pcntl_signal(SIGTSTP, $GLOBALS['__pemacs_tstp_handler']);
         }
-        // Segnala al main loop di invalidare e ridisegnare completamente
+        // Signal to main loop to invalidate and redraw completely
         $GLOBALS['__pemacs_sigcont'] = true;
-        // Assicurati che la lettura non resti bloccata
+        // Ensure reading doesn't get blocked
         @stream_set_blocking(STDIN, false);
     };
     @pcntl_signal(SIGCONT, $contHandler);
-    // Gestione asincrona: niente bisogno di pcntl_signal_dispatch nel loop
+    // Async handling: no need to call pcntl_signal_dispatch in the loop
     if (function_exists('pcntl_async_signals')) { @pcntl_async_signals(true); }
 }
 if ($quitImmediately) {
@@ -1779,7 +1867,7 @@ if ($quitImmediately) {
     fwrite(STDOUT, Ansi::clear()); fflush(STDOUT);
 } else {
     $editor->run();
-    // Ripristina terminale e pulisci esplicitamente lo schermo
+    // Restore terminal and explicitly clear the screen
     $term->restore();
     fwrite(STDOUT, Ansi::clear()); fflush(STDOUT);
 }
