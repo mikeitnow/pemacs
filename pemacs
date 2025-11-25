@@ -1598,8 +1598,9 @@ final class Editor {
 			if ($t === Keys::ASCII && $v === "\x1b") { $escCount++; if ($escCount >= 3) { $this->renderer->setStatus(''); return null; } else { continue; } }
 			else { $escCount = 0; }
 			if ($t === Keys::SPECIAL && $v === 'backspace') {
-				if ($input !== '') { $input = substr($input,0,-1); }
-				$showList = false; $lastWasTab = false; $handled = true;
+				// Behave like triple-ESC: exit file prompt and let caller redraw the screen
+				$this->renderer->setStatus('');
+				return null;
 			}
 			if ($t === Keys::ALT && $v === 'backspace') {
 				// Delete previous "word" (up to previous slash)
