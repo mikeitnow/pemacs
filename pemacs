@@ -106,10 +106,24 @@ final class Buffer {
 
     public function save(): bool {
         $target = $this->filePath !== '' ? $this->filePath : 'untitled.txt';
+        // Preserve original permissions if the file already exists
+        $oldPerms = null;
+        if (is_file($target)) {
+            $p = @fileperms($target);
+            if ($p !== false) {
+                $oldPerms = $p & 0777;
+            }
+        }
         $tmp = $target.'.tmp';
         $data = implode("\n", $this->lines);
         if (@file_put_contents($tmp, $data) === false) { return false; }
-        if (!@rename($tmp, $target)) { return false; }
+        if (!@rename($tmp, $target)) {
+            @unlink($tmp);
+            return false;
+        }
+        if ($oldPerms !== null) {
+            @chmod($target, $oldPerms);
+        }
         $this->dirty = false;
         $this->filePath = $target;
         return true;
