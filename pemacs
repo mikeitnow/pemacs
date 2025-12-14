@@ -193,7 +193,7 @@ final class Palette {
     // Colors inspired by a classic terminal look
     // Emacs-like: base fg white on black, comments gray, strings yellow, keywords bright magenta, variables cyan
     public static function base(): string { return '37;40'; }
-    public static function comment(): string { return '90'; }
+    public static function comment(): string { return '37'; }
     // Strings bright red by request
     public static function string(): string { return '91'; }
     public static function keyword(): string { return '95'; }
@@ -1497,10 +1497,53 @@ final class Editor {
 		while (true) {
 			$this->renderer->setStatus('Find file: '.$input);
 			$this->renderer->draw();
+            // If the list is visible, keep it in sync with the current minibuffer input:
+            // recompute the directory and the filtered candidates on every keypress.
+            if ($showList) {
+                $in = $input;
+                $scanBase = ($in !== '' && ($in[0] === '/' || $in[0] === '~')) ? '' : $dir;
+                if ($in !== '' && $in[0] === '~') {
+                    $scanBase = getenv('HOME') ?: '/';
+                    $in = substr($in, 1);
+                }
+                $slash = strrpos($in, '/');
+                if ($slash !== false) {
+                    $scanDir = ($input[0] === '/' || $input[0] === '~')
+                        ? substr($in, 0, $slash)
+                        : rtrim($scanBase, '/').'/'.substr($in, 0, $slash);
+                    $prefix = substr($in, $slash+1);
+                } else {
+                    $scanDir = ($scanBase === '' ? '/' : $scanBase);
+                    $prefix = $in;
+                }
+                if ($scanDir === '') { $scanDir = '/'; }
+                $cands = @scandir($scanDir) ?: [];
+                $cands = array_values(array_filter($cands, function($e){ return $e !== '.'; }));
+                usort($cands, function($a,$b) use ($scanDir){
+                    $da = is_dir(($scanDir==='/'?'/':rtrim($scanDir,'/').'/').$a);
+                    $db = is_dir(($scanDir==='/'?'/':rtrim($scanDir,'/').'/').$b);
+                    if ($da === $db) return strcmp($a,$b);
+                    return $da ? -1 : 1;
+                });
+                $matches = array_values(array_filter($cands, function($e) use ($prefix){ return $prefix === '' || strpos($e, $prefix) === 0; }));
+                $listAll = array_map(function($e) use ($scanDir){ return $e.(is_dir(($scanDir==='/'?'/':rtrim($scanDir,'/').'/').$e) ? '/' : ''); }, $matches ?: $cands);
+                $listDir = $scanDir;
+                if ($selIndex >= count($listAll)) {
+                    $selIndex = max(0, count($listAll)-1);
+                }
+                // Force a full redraw of the list on next pass to avoid stale rows / duplicates
+                $prevRows = 0;
+                $prevColsCount = 0;
+                $prevStartRow = 0;
+                $prevColWidth = 0;
+                $prevScroll = 0;
+                $prevSelIndex = $selIndex;
+            }
 			// Draw multi-column list with scrolling (double-Tab)
 			if ($showList) {
 				$rows = max(8, min($this->term->rows - 2, intdiv($this->term->rows - 1, 2)));
-				$startRow = $this->term->rows - 1 - $rows;
+				// Use the full area up to the penultimate line (last line is the minibuffer/status bar)
+				$startRow = $this->term->rows - $rows;
 				// Calculate widths and number of columns
 				$maxLen = 0; foreach ($listAll as $nm) { $maxLen = max($maxLen, strlen($nm)); }
 				$minCol = 12; $maxCol = 40;
@@ -1514,15 +1557,15 @@ final class Editor {
 				$layoutChanged = ($prevRows !== $rows || $prevColsCount !== $colsCount || $prevStartRow !== $startRow || $prevColWidth !== $colWidth || $prevScroll !== $scroll);
 				if ($layoutChanged || $prevRows === 0) {
 					// Full redraw: separator + all rows
-					for ($clr=$startRow-1; $clr<=$this->term->rows-1; $clr++) { fwrite(STDOUT, Ansi::move($clr, 1).Ansi::clearLine()); }
-                // Separator bar (modeline style) above the list
-                $w = $this->activeWin(); $buf = $this->wins[$this->active]->buffer;
-                $status = ($buf->dirty ? '*' : '-') . ' ' . ($buf->filePath !== '' ? $buf->filePath : '[No Name]');
-                $percent = (int)round((($w->cursorRow+1) / max(1, $buf->lineCount())) * 100);
-                $pos = 'L '.($w->cursorRow+1).', C '.($w->cursorCol+1).' ('.$percent.'%)';
-                $left = $status.'  '.$pos; $right = ''; $space = max(0, $this->term->cols - strlen($left) - strlen($right));
-                $sepBar = Ansi::color(Palette::activeStatus()).str_pad($left, $this->term->cols - strlen($right) - $space, ' ').str_repeat(' ', $space).$right.Ansi::reset();
-					fwrite(STDOUT, Ansi::move($startRow-1, 1).Ansi::clearLine().$sepBar);
+					$listOut = Ansi::hideCursor();
+					// Separator bar (modeline style) above the list
+					$w = $this->activeWin(); $buf = $this->wins[$this->active]->buffer;
+					$status = ($buf->dirty ? '*' : '-') . ' ' . ($buf->filePath !== '' ? $buf->filePath : '[No Name]');
+					$percent = (int)round((($w->cursorRow+1) / max(1, $buf->lineCount())) * 100);
+					$pos = 'L '.($w->cursorRow+1).', C '.($w->cursorCol+1).' ('.$percent.'%)';
+					$left = $status.'  '.$pos; $right = ''; $space = max(0, $this->term->cols - strlen($left) - strlen($right));
+					$sepBar = Ansi::color(Palette::activeStatus()).str_pad($left, $this->term->cols - strlen($right) - $space, ' ').str_repeat(' ', $space).$right.Ansi::reset();
+					$listOut .= Ansi::move($startRow-1, 1).Ansi::clearLine().$sepBar;
 					for ($r=0; $r<$rows; $r++) {
 						$lineStr = '';
 						for ($c=0; $c<$colsCount; $c++) {
@@ -1532,14 +1575,23 @@ final class Editor {
 							$cell = str_pad($label, max(0, $colWidth));
 							$lineStr .= ($isSel ? Ansi::color(Palette::selection()) : '').$cell.($isSel ? Ansi::reset() : '');
 						}
-						fwrite(STDOUT, Ansi::move($startRow + $r, 1).Ansi::clearLine().$lineStr);
+						$listOut .= Ansi::move($startRow + $r, 1).Ansi::clearLine().$lineStr;
 					}
+					// Restore editor cursor position (renderer has already computed window sizes)
+					$cur = $this->activeWin();
+					$cur->clampCursor($cur->buffer);
+					$cur->ensureCursorVisible($cur->buffer);
+					$cursorRowOnScreen = $cur->topRow + ($cur->cursorRow - $cur->scrollTop);
+					$cursorColOnScreen = 1 + max(0, $cur->cursorCol - $cur->hscroll);
+					$listOut .= Ansi::move($cursorRowOnScreen, $cursorColOnScreen).Ansi::showCursor();
+					fwrite(STDOUT, $listOut);
 					$prevRows = $rows; $prevColsCount = $colsCount; $prevStartRow = $startRow; $prevColWidth = $colWidth; $prevScroll = $scroll; $prevSelIndex = $selIndex;
 				} else {
 					// Partial redraw: only the row with old and new selection
 					$oldRow = ($prevSelIndex - $scroll) % $rows;
 					$newRow = ($selIndex - $scroll) % $rows;
 					$targets = array_unique(array_filter([$oldRow, $newRow], function($r) use ($rows){ return $r>=0 && $r<$rows; }));
+					$listOut = Ansi::hideCursor();
 					foreach ($targets as $r) {
 						$lineStr = '';
 						for ($c=0; $c<$colsCount; $c++) {
@@ -1549,17 +1601,33 @@ final class Editor {
 							$cell = str_pad($label, max(0, $colWidth));
 							$lineStr .= ($isSel ? Ansi::color(Palette::selection()) : '').$cell.($isSel ? Ansi::reset() : '');
 						}
-						fwrite(STDOUT, Ansi::move($startRow + $r, 1).Ansi::clearLine().$lineStr);
+						$listOut .= Ansi::move($startRow + $r, 1).Ansi::clearLine().$lineStr;
 					}
+					// Restore cursor to editor position
+					$cur = $this->activeWin();
+					$cur->clampCursor($cur->buffer);
+					$cur->ensureCursorVisible($cur->buffer);
+					$cursorRowOnScreen = $cur->topRow + ($cur->cursorRow - $cur->scrollTop);
+					$cursorColOnScreen = 1 + max(0, $cur->cursorCol - $cur->hscroll);
+					$listOut .= Ansi::move($cursorRowOnScreen, $cursorColOnScreen).Ansi::showCursor();
+					fwrite(STDOUT, $listOut);
 					$prevSelIndex = $selIndex;
 				}
 			} else {
 				// If the list is hidden, clear the list area and the separator line
 				$rows = max(8, min($this->term->rows - 2, intdiv($this->term->rows - 1, 2)));
-				$startRow = $this->term->rows - 1 - $rows;
+				$startRow = $this->term->rows - $rows;
+				$listOut = Ansi::hideCursor();
 				for ($clr=$startRow-1; $clr<=$this->term->rows-1; $clr++) {
-					fwrite(STDOUT, Ansi::move($clr, 1).Ansi::clearLine());
+					$listOut .= Ansi::move($clr, 1).Ansi::clearLine();
 				}
+				$cur = $this->activeWin();
+				$cur->clampCursor($cur->buffer);
+				$cur->ensureCursorVisible($cur->buffer);
+				$cursorRowOnScreen = $cur->topRow + ($cur->cursorRow - $cur->scrollTop);
+				$cursorColOnScreen = 1 + max(0, $cur->cursorCol - $cur->hscroll);
+				$listOut .= Ansi::move($cursorRowOnScreen, $cursorColOnScreen).Ansi::showCursor();
+				fwrite(STDOUT, $listOut);
 			}
 
 			$k = (new Input())->readKey();
@@ -1609,10 +1677,16 @@ final class Editor {
 				return $path;
 			}
 			if ($t === Keys::CTRL && $v === 'g') { $this->renderer->setStatus(''); return null; }
-			if ($t === Keys::ASCII && $v === "\x1b") { $escCount++; if ($escCount >= 3) { $this->renderer->setStatus(''); return null; } else { continue; } }
-			else { $escCount = 0; }
+			// Exit find-file with a single ESC (Emacs-like)
+			if ($t === Keys::ASCII && $v === "\x1b") { $this->renderer->setStatus(''); return null; }
+			// Backspace deletes last typed char (does not exit)
 			if ($t === Keys::SPECIAL && $v === 'backspace') {
-				// Behave like triple-ESC: exit file prompt and let caller redraw the screen
+				if ($input !== '') {
+					$input = substr($input, 0, -1);
+					$lastWasTab = false;
+					continue;
+				}
+				// If there's nothing to delete, exit (same as ESC)
 				$this->renderer->setStatus('');
 				return null;
 			}
@@ -1625,7 +1699,7 @@ final class Editor {
 				$showList = false; $lastWasTab = false; $handled = true;
 			}
 			if (!$handled && $t === Keys::ASCII && $v !== '') {
-				$input .= $v; $showList = false; $lastWasTab = false; $handled = true;
+				$input .= $v; $lastWasTab = false; $handled = true;
 			}
 			if ($t === Keys::SPECIAL && $v === 'tab') {
 				$wasShowing = $showList;
